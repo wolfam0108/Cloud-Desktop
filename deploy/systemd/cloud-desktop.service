@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloud Desktop (Gamescope + KWin + Plasma + Sunshine)
+After=network.target systemd-logind.service
+
+[Service]
+Type=simple
+User=user
+Group=user
+PAMName=login
+Environment=HOME=/home/user
+WorkingDirectory=/home/user
+ExecStart=/home/user/cloud-desktop-service.sh start
+ExecStop=/home/user/cloud-desktop-service.sh stop
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

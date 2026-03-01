@@ -1,0 +1,17 @@
+{
+  "env": {
+    "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"
+  },
+  "apps": [
+    {
+      "name": "Cloud Desktop",
+      "image-path": "",
+      "prep-cmd": [
+        {
+          "do": "/home/user/gamescope-resize.sh",
+          "undo": ""
+        }
+      ]
+    }
+  ]
+}

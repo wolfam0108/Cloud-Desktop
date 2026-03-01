@@ -440,15 +440,18 @@ dnf install -y \
 
 ## 11. Настройка скриптов и конфигов
 
+Все необходимые файлы находятся в каталоге [`deploy/`](deploy/README.md) клонированного репозитория.
+
 ### 11.1 Скрипты запуска
 
-Скопируйте скрипты из репозитория в `/home/user/`:
+Скопируйте скрипты из `deploy/scripts/` в `/home/user/`:
 
 ```bash
-# Из клонированного репозитория gamescope (или скачайте отдельно)
-cp scripts/cloud-desktop.sh /home/user/
-cp scripts/cloud-desktop-service.sh /home/user/
-cp scripts/gamescope-resize.sh /home/user/
+# Из клонированного репозитория gamescope
+cd /home/user/gamescope
+cp deploy/scripts/cloud-desktop.sh /home/user/
+cp deploy/scripts/cloud-desktop-service.sh /home/user/
+cp deploy/scripts/gamescope-resize.sh /home/user/
 
 chmod +x /home/user/cloud-desktop.sh
 chmod +x /home/user/cloud-desktop-service.sh
@@ -491,25 +494,7 @@ EOF
 ### 12.2 Приложения
 
 ```bash
-cat > ~/.config/sunshine/apps.json << 'EOF'
-{
-  "env": {
-    "GAMESCOPE_WAYLAND_DISPLAY": "gamescope-0"
-  },
-  "apps": [
-    {
-      "name": "Cloud Desktop",
-      "image-path": "",
-      "prep-cmd": [
-        {
-          "do": "/home/user/gamescope-resize.sh",
-          "undo": ""
-        }
-      ]
-    }
-  ]
-}
-EOF
+cp /home/user/gamescope/deploy/sunshine/apps.json ~/.config/sunshine/apps.json
 ```
 
 > [!TIP]
@@ -524,20 +509,8 @@ EOF
 ### 13.1 Wrapper для ksmserver-logout-greeter
 
 ```bash
-cat > /usr/local/bin/ksmserver-logout-greeter-wrapper << 'WRAPPER'
-#!/bin/bash
-# Wrapper для ksmserver-logout-greeter
-# D-Bus activation через dbus-launch не передаёт env vars потомкам,
-# поэтому читаем DISPLAY/WAYLAND из файла, созданного cloud-desktop скриптом.
-ENV_FILE="/tmp/cloud-desktop/desktop_env"
-if [ -f "$ENV_FILE" ]; then
-    set -a
-    source "$ENV_FILE"
-    set +a
-fi
-exec /usr/libexec/ksmserver-logout-greeter "$@"
-WRAPPER
-
+cp /home/user/gamescope/deploy/scripts/ksmserver-logout-greeter-wrapper.sh \
+   /usr/local/bin/ksmserver-logout-greeter-wrapper
 chmod +x /usr/local/bin/ksmserver-logout-greeter-wrapper
 ```
 
@@ -546,12 +519,15 @@ chmod +x /usr/local/bin/ksmserver-logout-greeter-wrapper
 ```bash
 su - user
 mkdir -p ~/.local/share/dbus-1/services
+cp /home/user/gamescope/deploy/systemd/org.kde.LogoutPrompt.service \
+   ~/.local/share/dbus-1/services/
+```
 
-cat > ~/.local/share/dbus-1/services/org.kde.LogoutPrompt.service << 'EOF'
-[D-BUS Service]
-Name=org.kde.LogoutPrompt
-Exec=/usr/local/bin/ksmserver-logout-greeter-wrapper
-EOF
+### 13.3 Polkit правила (shutdown/reboot без пароля)
+
+```bash
+cp /home/user/gamescope/deploy/polkit/50-cloud-desktop.rules \
+   /etc/polkit-1/rules.d/
 ```
 
 ---
@@ -590,30 +566,11 @@ ninja -C /home/user/kcm-cloud-mouse/build install
 
 ## 15. Systemd-сервис и автозапуск
 
-### 15.1 Создание сервиса
+### 15.1 Установка сервиса
 
 ```bash
-cat > /etc/systemd/system/cloud-desktop.service << 'EOF'
-[Unit]
-Description=Cloud Desktop (Gamescope + KWin + Plasma + Sunshine)
-After=network.target systemd-logind.service
-
-[Service]
-Type=simple
-User=user
-Group=user
-PAMName=login
-Environment=HOME=/home/user
-WorkingDirectory=/home/user
-ExecStart=/home/user/cloud-desktop-service.sh start
-ExecStop=/home/user/cloud-desktop-service.sh stop
-TimeoutStopSec=15
-Restart=on-failure
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
+cp /home/user/gamescope/deploy/systemd/cloud-desktop.service \
+   /etc/systemd/system/cloud-desktop.service
 ```
 
 ### 15.2 Активация автозапуска

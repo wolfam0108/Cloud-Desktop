@@ -1,0 +1,12 @@
+// Cloud Desktop: разрешить user выполнять poweroff/reboot без пароля.
+// Без этого правила Plasma показывает кнопки, но polkit возвращает "challenge"
+// и запрашивает пароль через агент, которого нет в стриминг-сессии.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.power-off" ||
+         action.id == "org.freedesktop.login1.power-off-multiple-sessions" ||
+         action.id == "org.freedesktop.login1.reboot" ||
+         action.id == "org.freedesktop.login1.reboot-multiple-sessions") &&
+        subject.user == "user") {
+        return polkit.Result.YES;
+    }
+});
