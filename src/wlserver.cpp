@@ -44,6 +44,14 @@
 #include <wlr/types/wlr_relative_pointer_v1.h>
 #include <wlr/types/wlr_pointer_constraints_v1.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
+#include <wlr/types/wlr_subcompositor.h>
+#include <wlr/types/wlr_viewporter.h>
+#include <wlr/types/wlr_single_pixel_buffer_v1.h>
+#include <wlr/types/wlr_screencopy_v1.h>
+#include <wlr/render/allocator.h>
+#include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/interfaces/wlr_output.h>
 #include <wlr/util/region.h>
 #include "wlr_end.hpp"
 
@@ -114,6 +122,7 @@ struct wlr_surface *wlserver_surface_to_main_surface( struct wlr_surface *pSurfa
 bool wlserver_process_hotkeys( wlr_keyboard *keyboard, uint32_t key, bool press );
 
 extern std::atomic<bool> hasRepaint;
+extern std::atomic<std::chrono::steady_clock::time_point> g_tLastSunshinePresent;
 
 std::vector<ResListEntry_t>& gamescope_xwayland_server_t::retrieve_commits()
 {
@@ -212,6 +221,11 @@ void wlserver_xdg_commit(struct wlr_surface *surf, struct wlr_buffer *buf)
 		wlserver.xdg_commit_queue.push_back( std::move( *oEntry ) );
 	}
 
+	// [sunshine] НЕ ставим xdg_dirty здесь!
+	// xdg_dirty=true сбрасывает focusWindow=nullptr в steamcompmgr_check_xdg(),
+	// что приводит к focusMatch=0 в handle_done_commit → HELD_COMMIT_BASE не обновляется.
+	// xdg_dirty нужен только для structural changes (map/unmap/create).
+	// handle_done_commits_xdg() вызывается ВСЕГДА, вне if(xdg_dirty) блока.
 	nudge_steamcompmgr();
 }
 
@@ -226,7 +240,19 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface) {
 		if ( !wlserver_xdg_surface_info->bDoneConfigure )
 		{
 			if ( wlserver_xdg_surface_info->xdg_surface )
+			{
+				// [sunshine] Явно задаём размер и activated для KWin handshake
+				if ( wlserver_xdg_surface_info->xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
+				     wlserver_xdg_surface_info->xdg_surface->toplevel )
+				{
+					wlr_xdg_toplevel_set_size( wlserver_xdg_surface_info->xdg_surface->toplevel,
+						g_nOutputWidth, g_nOutputHeight );
+					wlr_xdg_toplevel_set_activated( wlserver_xdg_surface_info->xdg_surface->toplevel, true );
+					wl_log.infof( "[sunshine] XDG configure: set_size %dx%d, activated=true",
+						g_nOutputWidth, g_nOutputHeight );
+				}
 				wlr_xdg_surface_schedule_configure( wlserver_xdg_surface_info->xdg_surface );
+			}
 
 			if ( wlserver_xdg_surface_info->layer_surface )
 				wlr_layer_surface_v1_configure( wlserver_xdg_surface_info->layer_surface, g_nNestedWidth, g_nNestedHeight );
@@ -235,10 +261,31 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface) {
 		}
 	}
 
+	// [sunshine] Subsurface forwarding: KWin рендерит в subsurface.
+	// Main surface получает 1×1 dummy, subsurface — реальный контент.
+	// Для matching в check_new_xdg_res() нужен parent surface pointer,
+	// но texture должна браться из subsurface.
+	struct wlr_surface *commit_surf = wlr_surface; // по умолчанию — сам surface
+	if ( !wlserver_xdg_surface_info && !wlserver_x11_surface_info )
+	{
+		struct wlr_subsurface *subsurface = wlr_subsurface_try_from_wlr_surface( wlr_surface );
+		if ( subsurface && subsurface->parent )
+		{
+			wlserver_xdg_surface_info = get_wl_surface_info( subsurface->parent )->xdg_surface;
+			if ( wlserver_xdg_surface_info )
+			{
+				// commit_surf = parent (для matching), wlr_surface остаётся subsurface (для texture)
+				commit_surf = subsurface->parent;
+				wl_log.infof( "[sunshine] Subsurface commit forwarded to parent XDG surface" );
+			}
+		}
+	}
+
 	// Committing without buffer state is valid and commits the same buffer again.
 	// Mutter and Weston have forward progress on the frame callback in this situation,
 	// so let the commit go through. It will be duplication-eliminated later.
 
+	// texture берётся из ОРИГИНАЛЬНОГО surface (subsurface при forwarding)
 	VulkanWlrTexture_t *tex = (VulkanWlrTexture_t *) wlr_surface_get_texture( wlr_surface );
 	if ( tex == NULL )
 	{
@@ -256,7 +303,18 @@ void xwayland_surface_commit(struct wlr_surface *wlr_surface) {
 	}
 	else if (wlserver_xdg_surface_info)
 	{
-		wlserver_xdg_commit(wlr_surface, buf);
+		// commit_surf = parent surface для matching, buf = subsurface texture
+		wlserver_xdg_commit(commit_surf, buf);
+
+		// [sunshine] Отправляем frame_done на subsurface сразу после forwarding.
+		// KWin ждёт frame callback именно на subsurface.
+		// 1 frame_done per commit (не 10x/сек как в flush_frame_done).
+		if ( commit_surf != wlr_surface )
+		{
+			struct timespec now;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			wlr_surface_send_frame_done( wlr_surface, &now );
+		}
 	}
 	else
 	{
@@ -1250,6 +1308,104 @@ void wlserver_app_presented( uint32_t app_id, uint64_t frametime_ns )
 	wlserver.app_perf_requests.erase( it );
 }
 
+static void gamescope_control_set_output_mode(
+	struct wl_client *client,
+	struct wl_resource *resource,
+	uint32_t width,
+	uint32_t height,
+	uint32_t refresh_mhz )
+{
+	assert( wlserver_is_lock_held() );
+
+	fprintf( stderr, "[gamescope-control] set_output_mode: %ux%u @ %u mHz\n",
+		width, height, refresh_mhz );
+
+	// Валидация
+	if ( width == 0 || height == 0 || width > 7680 || height > 4320 )
+	{
+		fprintf( stderr, "[gamescope-control] set_output_mode: invalid resolution %ux%u\n", width, height );
+		return;
+	}
+	if ( refresh_mhz == 0 || refresh_mhz > 360000 )
+	{
+		fprintf( stderr, "[gamescope-control] set_output_mode: invalid refresh %u mHz\n", refresh_mhz );
+		return;
+	}
+
+	// Если без изменений — подтвердить сразу
+	if ( (uint32_t)g_nOutputWidth == width &&
+		 (uint32_t)g_nOutputHeight == height &&
+		 g_nOutputRefresh == (int)refresh_mhz )
+	{
+		fprintf( stderr, "[gamescope-control] set_output_mode: mode unchanged, confirming\n" );
+		gamescope_control_send_mode_changed( resource, width, height, refresh_mhz );
+		return;
+	}
+
+	// 1. Обновляем глобалы разрешения
+	g_nOutputWidth = width;
+	g_nOutputHeight = height;
+	g_nNestedWidth = width;
+	g_nNestedHeight = height;
+	g_nOutputRefresh = refresh_mhz;
+	g_nNestedRefresh = refresh_mhz;
+
+	fprintf( stderr, "[gamescope-control] set_output_mode: globals updated\n" );
+
+	// 2. Пересоздаём GBM slot pool через backend DirtyState
+	auto *pBackend = GetBackend();
+	if ( pBackend )
+		pBackend->DirtyState( true, true );
+
+	// 3. Обновляем wlr_output mode для KWin и Sunshine screencopy
+	// Не используем wlr_output_commit_state() — он вызывает output_ensure_buffer()
+	// для swapchain, а sunshine headless output не имеет allocator/renderer.
+	// Вместо этого прямо обновляем поля wlr_output и рассылаем wl_output.mode event.
+	if ( wlserver.sunshine_output )
+	{
+		wlserver.sunshine_output->width = width;
+		wlserver.sunshine_output->height = height;
+		wlserver.sunshine_output->refresh = refresh_mhz;
+
+		// Рассылаем wl_output.mode event всем клиентам (KWin, Sunshine)
+		struct wl_resource *resource;
+		wl_resource_for_each( resource, &wlserver.sunshine_output->resources )
+		{
+			wl_output_send_mode( resource,
+				WL_OUTPUT_MODE_CURRENT,
+				width, height, refresh_mhz );
+			wl_output_send_done( resource );
+		}
+
+		fprintf( stderr, "[gamescope-control] set_output_mode: wlr_output updated %dx%d@%d mHz\n",
+			width, height, refresh_mhz );
+	}
+
+	// 4. Отправляем xdg_toplevel.configure(new_w, new_h) всем XDG окнам (KWin)
+	// Без этого KWin продолжает рендерить в старом разрешении — получается scaling.
+	for ( auto &win : wlserver.xdg_wins )
+	{
+		if ( win && win->type == steamcompmgr_win_type_t::XDG )
+		{
+			auto &surf_info = win->xdg().surface;
+			if ( surf_info.xdg_surface &&
+			     surf_info.xdg_surface->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL &&
+			     surf_info.xdg_surface->toplevel )
+			{
+				wlr_xdg_toplevel_set_size( surf_info.xdg_surface->toplevel, width, height );
+				wlr_xdg_toplevel_set_activated( surf_info.xdg_surface->toplevel, true );
+				wlr_xdg_surface_schedule_configure( surf_info.xdg_surface );
+				fprintf( stderr, "[gamescope-control] set_output_mode: sent xdg_configure %dx%d to win %u\n",
+					width, height, win->id() );
+			}
+		}
+	}
+
+	// 5. Подтверждение клиенту
+	gamescope_control_send_mode_changed( resource, width, height, refresh_mhz );
+	fprintf( stderr, "[gamescope-control] set_output_mode: done, sent mode_changed event\n" );
+}
+
 static const struct gamescope_control_interface gamescope_control_impl = {
 	.destroy = gamescope_control_handle_destroy,
 	.set_app_target_refresh_cycle = gamescope_control_set_app_target_refresh_cycle,
@@ -1258,6 +1414,7 @@ static const struct gamescope_control_interface gamescope_control_impl = {
 	.set_look = gamescope_control_set_look,
 	.unset_look = gamescope_control_unset_look,
 	.request_app_performance_stats = gamescope_control_request_app_performance_stats,
+	.set_output_mode = gamescope_control_set_output_mode,
 };
 
 static uint32_t get_conn_display_info_flags()
@@ -1337,7 +1494,7 @@ static void gamescope_control_bind( struct wl_client *client, void *data, uint32
 
 static void create_gamescope_control( void )
 {
-	uint32_t version = 6;
+	uint32_t version = 7;
 	wl_global_create( wlserver.display, &gamescope_control_interface, version, NULL, gamescope_control_bind );
 }
 
@@ -1620,6 +1777,10 @@ static bool filter_global(const struct wl_client *client, const struct wl_global
 			return server->get_output() == output;
 	}
 
+	/* Sunshine output is visible to all non-XWayland Wayland clients */
+	if ( wlserver.sunshine_output && output == wlserver.sunshine_output )
+		return true;
+
 	if (wlserver.wlr.xwayland_servers.empty())
 		return false;
 
@@ -1886,6 +2047,13 @@ wlserver_xdg_surface_info* waylandy_type_surface_new(struct wl_client *client, s
 	xdg_surface_info->unmap.notify = xdg_surface_unmap;
 	wl_signal_add(&surface->events.unmap, &xdg_surface_info->unmap);
 
+	// [sunshine] Ставим dirty при создании XDG surface, чтобы steamcompmgr
+	// увидел окно ДО первого commit и отправил bootstrap frame_done.
+	// Без этого: KWin ждёт frame_callback → не делает commit → xdg_surface_map
+	// не вызывается → xdg_dirty не ставится → deadlock.
+	wlserver.xdg_dirty = true;
+	nudge_steamcompmgr();
+
 	for (auto it = g_PendingCommits.begin(); it != g_PendingCommits.end();)
 	{
 		if (it->surf == surface)
@@ -1991,6 +2159,11 @@ bool wlserver_init( void ) {
 
 	wlserver.wlr.compositor = wlr_compositor_create(wlserver.display, 5, wlserver.wlr.renderer);
 
+	// [sunshine] Обязательные протоколы для KWin
+	wlr_subcompositor_create(wlserver.display);
+	wlr_viewporter_create(wlserver.display);
+	wlr_single_pixel_buffer_manager_v1_create(wlserver.display);
+
 	wl_signal_add( &wlserver.wlr.compositor->events.new_surface, &new_surface_listener );
 
 	create_ime_manager( &wlserver );
@@ -2078,6 +2251,284 @@ bool wlserver_init( void ) {
 	wlserver.wlr.seat = wlr_seat_create(wlserver.display, "seat0");
 	wlr_seat_set_capabilities( wlserver.wlr.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD | WL_SEAT_CAPABILITY_TOUCH );
 
+	// [sunshine] Перехват Wayland cursor от XDG клиентов (KWin).
+	wlserver.request_set_cursor_listener.notify = []( struct wl_listener *listener, void *data )
+	{
+		auto *event = (struct wlr_seat_pointer_request_set_cursor_event *)data;
+		wlserver.wayland_cursor_surface = event->surface;
+		wlserver.wayland_cursor_hotspot_x = event->hotspot_x;
+		wlserver.wayland_cursor_hotspot_y = event->hotspot_y;
+		wlserver.wayland_cursor_changed.store( true );
+		wl_log.infof( "[sunshine] Wayland cursor set: surface=%p hotspot=(%d,%d)",
+			event->surface, event->hotspot_x, event->hotspot_y );
+	};
+	wl_signal_add( &wlserver.wlr.seat->events.request_set_cursor, &wlserver.request_set_cursor_listener );
+
+	// Sunshine backend: screencopy manager + dedicated wlr_output
+	wlserver.sunshine_screencopy_manager = wlr_screencopy_manager_v1_create( wlserver.display );
+	if ( !wlserver.sunshine_screencopy_manager )
+	{
+		wl_log.errorf( "[sunshine] Failed to create screencopy manager" );
+	}
+	else
+	{
+		wl_log.infof( "[sunshine] screencopy manager created" );
+	}
+
+	// Create a dedicated sunshine wlr_output for screencopy
+	wlserver.sunshine_output = wlr_headless_add_output( wlserver.wlr.headless_backend, g_nOutputWidth, g_nOutputHeight );
+	if ( wlserver.sunshine_output )
+	{
+		wlserver.sunshine_output_state = new wlr_output_state;
+		wlr_output_state_init( wlserver.sunshine_output_state );
+		wlserver.sunshine_output->make = strdup( "gamescope" );
+		wlserver.sunshine_output->model = strdup( "sunshine" );
+		wlr_output_set_name( wlserver.sunshine_output, "sunshine" );
+		wlr_output_state_set_enabled( wlserver.sunshine_output_state, true );
+		wlr_output_state_set_custom_mode( wlserver.sunshine_output_state, g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
+		if ( !wlr_output_commit_state( wlserver.sunshine_output, wlserver.sunshine_output_state ) )
+		{
+			wl_log.errorf( "[sunshine] Failed to commit sunshine output" );
+		}
+		wlr_output_create_global( wlserver.sunshine_output, wlserver.display );
+		wl_log.infof( "[sunshine] Created wlr_output %dx%d @ %d mHz", g_nOutputWidth, g_nOutputHeight, g_nOutputRefresh );
+
+		// Screencopy: привязать renderer + allocator к sunshine_output
+		struct wlr_allocator *sunshine_alloc = wlr_allocator_autocreate(
+			wlserver.wlr.headless_backend, wlserver.wlr.renderer );
+		if ( sunshine_alloc )
+		{
+			wlserver.sunshine_allocator = sunshine_alloc;
+			if ( wlr_output_init_render( wlserver.sunshine_output,
+										sunshine_alloc, wlserver.wlr.renderer ) )
+			{
+				wl_log.infof( "[sunshine] Render pipeline: allocator=%p renderer=%p",
+					(void*)sunshine_alloc, (void*)wlserver.wlr.renderer );
+				wl_log.infof( "[sunshine] allocator buffer_caps=0x%x (DMABUF=%d SHM=%d DATA_PTR=%d)",
+					sunshine_alloc->buffer_caps,
+					!!(sunshine_alloc->buffer_caps & WLR_BUFFER_CAP_DMABUF),
+					!!(sunshine_alloc->buffer_caps & WLR_BUFFER_CAP_SHM),
+					!!(sunshine_alloc->buffer_caps & WLR_BUFFER_CAP_DATA_PTR) );
+				wl_log.infof( "[sunshine] output render_format=0x%x enabled=%d",
+					wlserver.sunshine_output->render_format,
+					wlserver.sunshine_output->enabled );
+			}
+			else
+				wl_log.errorf( "[sunshine] wlr_output_init_render failed" );
+		}
+		else
+			wl_log.errorf( "[sunshine] wlr_allocator_autocreate failed" );
+
+	}
+	else
+	{
+		wl_log.errorf( "[sunshine] Failed to create headless output" );
+	}
+
+	// Sunshine eventfd for Present→WaylandThread signaling
+	wlserver.sunshine_eventfd = eventfd( 0, EFD_NONBLOCK | EFD_CLOEXEC );
+	if ( wlserver.sunshine_eventfd >= 0 )
+	{
+		wlserver.sunshine_event_source = wl_event_loop_add_fd(
+			wlserver.event_loop, wlserver.sunshine_eventfd, WL_EVENT_READABLE,
+			[]( int fd, uint32_t mask, void *data ) -> int
+			{
+				uint64_t val;
+				read( fd, &val, sizeof(val) );
+
+				if ( !wlserver.sunshine_output )
+					return 0;
+
+				// Забираем pending slot из steamcompmgr thread
+				void *pending_slot_ptr = nullptr;
+				{
+					std::lock_guard<std::mutex> lock( wlserver.sunshine_lock );
+					pending_slot_ptr = wlserver.sunshine_pending_slot;
+					wlserver.sunshine_pending_slot = nullptr;
+				}
+
+				if ( pending_slot_ptr )
+				{
+					struct wlr_buffer *pending_buf = (struct wlr_buffer *)pending_slot_ptr;
+
+					// Освобождаем предыдущий committed slot через callback
+					if ( wlserver.sunshine_committed_slot && wlserver.sunshine_release_func )
+					{
+						wlserver.sunshine_release_func( wlserver.sunshine_committed_slot );
+					}
+
+					// Commit нового буфера
+					struct wlr_output_state state;
+					wlr_output_state_init( &state );
+					wlr_output_state_set_buffer( &state, pending_buf );
+					bool ok = wlr_output_commit_state( wlserver.sunshine_output, &state );
+					wlr_output_state_finish( &state );
+
+					if ( !ok )
+					{
+						fprintf( stderr, "[sunshine] eventfd: wlr_output_commit_state FAILED\n" );
+						// Release slot если commit не прошёл
+						if ( wlserver.sunshine_release_func )
+							wlserver.sunshine_release_func( pending_slot_ptr );
+					}
+					else
+					{
+						// Запоминаем как committed
+						wlserver.sunshine_committed_slot = pending_slot_ptr;
+
+						// [OPT-1] Выбор режима: direct vs throttled
+						if ( wlserver.sunshine_vblank_mode == 0 )
+						{
+							// DIRECT: send_frame сразу — минимальная задержка
+							if ( wlserver.sunshine_output )
+							{
+								wlr_output_send_frame( wlserver.sunshine_output );
+
+								// [diag] Каждый 500-й кадр
+								static uint64_t s_nDirectFrames = 0;
+								if ( ++s_nDirectFrames % 500 == 0 )
+									wl_log.infof( "[sunshine] direct send_frame #%lu", (unsigned long)s_nDirectFrames );
+							}
+						}
+						else
+						{
+							// THROTTLED: флаг для VBlank timer
+							wlserver.sunshine_has_pending_frame = true;
+						}
+					}
+				}
+				return 0;
+			},
+			nullptr );
+		wl_log.infof( "[sunshine] eventfd %d created for frame signaling", wlserver.sunshine_eventfd );
+
+		// [OPT-1] Выбор режима VBlank:
+		//   GAMESCOPE_SUNSHINE_VBLANK_MODE:
+		//     "direct" (или 0) — send_frame сразу из eventfd, timer = heartbeat only
+		//     "4x"    (или 4)  — 240 Hz throttle (4ms)
+		//     "2x"    (или 2)  — 120 Hz throttle (8ms)
+		//     "1x"    (или 1)  — 60 Hz throttle (16ms, старое поведение)
+		{
+			const char *pszMode = getenv( "GAMESCOPE_SUNSHINE_VBLANK_MODE" );
+			if ( !pszMode || strcmp( pszMode, "direct" ) == 0 || strcmp( pszMode, "0" ) == 0 )
+				wlserver.sunshine_vblank_mode = 0;
+			else if ( strcmp( pszMode, "4x" ) == 0 || strcmp( pszMode, "4" ) == 0 )
+				wlserver.sunshine_vblank_mode = 4;
+			else if ( strcmp( pszMode, "2x" ) == 0 || strcmp( pszMode, "2" ) == 0 )
+				wlserver.sunshine_vblank_mode = 2;
+			else if ( strcmp( pszMode, "1x" ) == 0 || strcmp( pszMode, "1" ) == 0 )
+				wlserver.sunshine_vblank_mode = 1;
+			else
+				wlserver.sunshine_vblank_mode = 0; // default = direct
+
+			const char* modeNames[] = { "direct", "1x (60Hz)", "2x (120Hz)", "", "4x (240Hz)" };
+			const char* modeName = ( wlserver.sunshine_vblank_mode <= 4 ) ? modeNames[wlserver.sunshine_vblank_mode] : "unknown";
+			wl_log.infof( "[sunshine] VBlank mode: %s (env=%s)", modeName, pszMode ? pszMode : "(default)" );
+		}
+
+		// [sunshine] VBlank Timer: heartbeat + throttled frame delivery
+		// - direct mode: timer только для heartbeat (500ms idle recovery)
+		// - throttled mode: timer также отправляет send_frame с заданной частотой
+		{
+			int nRefreshHz = g_nOutputRefresh > 0 ? ( g_nOutputRefresh / 1000 ) : 60;
+			if ( nRefreshHz <= 0 ) nRefreshHz = 60;
+
+			// Вычисляем интервал таймера в зависимости от режима
+			int nTimerIntervalMs;
+			if ( wlserver.sunshine_vblank_mode == 0 )
+				nTimerIntervalMs = 100; // heartbeat polling: достаточно 10Hz для 500ms idle detect
+			else if ( wlserver.sunshine_vblank_mode == 4 )
+				nTimerIntervalMs = 4;   // 240 Hz
+			else if ( wlserver.sunshine_vblank_mode == 2 )
+				nTimerIntervalMs = 8;   // 120 Hz
+			else
+				nTimerIntervalMs = 1000 / nRefreshHz; // 1x = refresh rate
+
+			wlserver.sunshine_vblank_timer = wl_event_loop_add_timer(
+				wlserver.event_loop,
+				[]( void *data ) -> int
+				{
+				// [sunshine] Frame signal: только в throttled mode
+				if ( wlserver.sunshine_vblank_mode > 0 &&
+				     wlserver.sunshine_has_pending_frame &&
+				     wlserver.sunshine_output )
+				{
+					wlr_output_send_frame( wlserver.sunshine_output );
+					wlserver.sunshine_has_pending_frame = false;
+				}
+
+					// [sunshine] Heartbeat auto-recovery из чёрного экрана.
+					// Если >500ms без Present при активном output → force repaint.
+					if ( wlserver.sunshine_output )
+					{
+						auto tLastPresent = g_tLastSunshinePresent.load();
+						auto tNow = std::chrono::steady_clock::now();
+						auto nSincePresent = std::chrono::duration_cast<std::chrono::milliseconds>( tNow - tLastPresent ).count();
+						if ( nSincePresent >= 500 )
+						{
+							hasRepaint = true;
+							nudge_steamcompmgr();
+							g_tLastSunshinePresent.store( tNow ); // reset чтобы не спамить
+							static int s_nHeartbeatCount = 0;
+							s_nHeartbeatCount++;
+							if ( s_nHeartbeatCount <= 3 || s_nHeartbeatCount % 10 == 0 )
+								wl_log.infof( "[sunshine] heartbeat repaint #%d (idle %lld ms)",
+									s_nHeartbeatCount, (long long)nSincePresent );
+						}
+					}
+
+					// [sunshine-diag] VBlank timer stats каждые 5 сек
+					{
+						static int s_nTicks = 0;
+						static int s_nFramesSent = 0;
+						static auto s_tLast = std::chrono::steady_clock::now();
+
+						s_nTicks++;
+						// Считаем frame signals (pending_frame уже обработан выше)
+						if ( wlserver.sunshine_vblank_mode > 0 && ! wlserver.sunshine_has_pending_frame )
+							s_nFramesSent++;
+
+						auto tNow = std::chrono::steady_clock::now();
+						auto nMs = std::chrono::duration_cast<std::chrono::milliseconds>( tNow - s_tLast ).count();
+						if ( nMs >= 5000 )
+						{
+							wl_log.infof( "[sunshine-diag] VBlank 5s: mode=%d ticks=%d frames_timer=%d",
+								wlserver.sunshine_vblank_mode, s_nTicks, s_nFramesSent );
+							s_nTicks = 0;
+							s_nFramesSent = 0;
+							s_tLast = tNow;
+						}
+					}
+
+					// Rearm timer
+					int nRearmMs;
+					if ( wlserver.sunshine_vblank_mode == 0 )
+						nRearmMs = 100; // heartbeat only
+					else if ( wlserver.sunshine_vblank_mode == 4 )
+						nRearmMs = 4;
+					else if ( wlserver.sunshine_vblank_mode == 2 )
+						nRearmMs = 8;
+					else
+					{
+						int nHz = g_nOutputRefresh > 0 ? ( g_nOutputRefresh / 1000 ) : 60;
+						if ( nHz <= 0 ) nHz = 60;
+						nRearmMs = 1000 / nHz;
+					}
+					wl_event_source_timer_update( wlserver.sunshine_vblank_timer, nRearmMs );
+					return 0;
+				},
+				nullptr );
+
+			// Первый запуск timer
+			wl_event_source_timer_update( wlserver.sunshine_vblank_timer, nTimerIntervalMs );
+			wl_log.infof( "[sunshine] VBlank timer started: %dms interval, mode=%d", nTimerIntervalMs, wlserver.sunshine_vblank_mode );
+		}
+	}
+	else
+	{
+		wl_log.errorf( "[sunshine] Failed to create eventfd" );
+	}
+
 	wl_log.infof("Running compositor on wayland display '%s'", wlserver.wl_display_name);
 
 	if (!wlr_backend_start( wlserver.wlr.multi_backend ))
@@ -2127,6 +2578,41 @@ bool wlserver_init( void ) {
 				wl_log.errorf("wl_event_loop_dispatch failed\n");
 				return false;
 			}
+		}
+	}
+
+	// === XDG Output Manager для Sunshine WLR capture ===
+	// Создаём ПОСЛЕ XWayland серверов, чтобы все output'ы были в layout
+	if ( wlserver.sunshine_output )
+	{
+		wlserver.sunshine_output_layout = wlr_output_layout_create( wlserver.display );
+		if ( wlserver.sunshine_output_layout )
+		{
+			// Добавляем sunshine output
+			wlr_output_layout_add( wlserver.sunshine_output_layout, wlserver.sunshine_output, 0, 0 );
+
+			// Добавляем все XWayland output'ы в layout
+			int xw_x_offset = g_nOutputWidth;
+			for ( auto &xwserver : wlserver.wlr.xwayland_servers )
+			{
+				if ( xwserver && xwserver->get_output() )
+				{
+					wlr_output_layout_add( wlserver.sunshine_output_layout, xwserver->get_output(), xw_x_offset, 0 );
+					xw_x_offset += 1280;
+				}
+			}
+
+			wlserver.sunshine_xdg_output_manager = wlr_xdg_output_manager_v1_create(
+				wlserver.display, wlserver.sunshine_output_layout );
+			if ( wlserver.sunshine_xdg_output_manager )
+				wl_log.infof( "[sunshine] xdg_output_manager created with %zu outputs in layout",
+					wlserver.wlr.xwayland_servers.size() + 1 );
+			else
+				wl_log.errorf( "[sunshine] Failed to create xdg_output_manager" );
+		}
+		else
+		{
+			wl_log.errorf( "[sunshine] Failed to create output_layout" );
 		}
 	}
 
@@ -2417,6 +2903,9 @@ void wlserver_oncursorevent()
 
 	if ( !wlserver.bCursorHidden && wlserver.bCursorHasImage )
 	{
+		// [sunshine] Throttle теперь на уровне VBlank Timer в wlserver.
+		// hasRepaint = true допустим: steamcompmgr paint_all() уже привязан к
+		// vblank через bShouldPaint = vblank && hasRepaint (строка 9164).
 		hasRepaint = true;
 	}
 }
@@ -2677,6 +3166,8 @@ void wlserver_mousemotion( double dx, double dy, uint32_t time )
 	dx *= g_mouseSensitivity;
 	dy *= g_mouseSensitivity;
 
+	// [sunshine] Батчинг: восстановлены все Wayland-уведомления.
+	// Motion events теперь отправляются ТОЛЬКО из frame tick (синхронно с frame signal).
 	wlserver_perform_rel_pointer_motion( dx, dy );
 
 	if ( !wlserver_apply_constraint( &dx, &dy ) )
@@ -3063,6 +3554,12 @@ void wlserver_x11_surface_info_init( struct wlserver_x11_surface_info *surf, gam
 
 void gamescope_xwayland_server_t::set_wl_id( struct wlserver_x11_surface_info *surf, uint32_t id )
 {
+	if ( !surf )
+	{
+		wl_log.errorf( "[set_wl_id] surf is NULL for id=%u, skipping", id );
+		return;
+	}
+
 	if (surf->wl_id)
 	{
 		if (surf->main_surface)

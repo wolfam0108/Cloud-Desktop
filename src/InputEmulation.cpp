@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 
 #include "backend.h"
 #include "InputEmulation.h"
@@ -64,6 +65,14 @@ namespace gamescope
     void GamescopeInputServer::OnPollIn()
     {
         static uint32_t s_uSequence = 0;
+
+        // [sunshine-diag] Счётчики для диагностики типов событий
+        static uint32_t s_nRelMotion = 0;
+        static uint32_t s_nAbsMotion = 0;
+        static uint32_t s_nButtons = 0;
+        static uint32_t s_nKeys = 0;
+        static uint32_t s_nScroll = 0;
+        static auto s_tLastReport = std::chrono::steady_clock::now();
 
         eis_dispatch( m_pEis );
 
@@ -169,6 +178,7 @@ namespace gamescope
                 case EIS_EVENT_POINTER_MOTION:
                 {
                     GetBackend()->NotifyPhysicalInput( InputType::Mouse );
+                    s_nRelMotion++;
 
                     wlserver_lock();
                     wlserver_mousemotion( eis_event_pointer_get_dx( pEisEvent ), eis_event_pointer_get_dy( pEisEvent ), ++s_uSequence );
@@ -179,15 +189,20 @@ namespace gamescope
                 case EIS_EVENT_POINTER_MOTION_ABSOLUTE:
                 {
                     GetBackend()->NotifyPhysicalInput( InputType::Mouse );
+                    s_nAbsMotion++;
+                    double absX = eis_event_pointer_get_absolute_x( pEisEvent );
+                    double absY = eis_event_pointer_get_absolute_y( pEisEvent );
+                    gamescope_ei.infof( "[eis-diag] ABS_MOTION x=%.1f y=%.1f", absX, absY );
 
                     wlserver_lock();
-                    wlserver_mousewarp( eis_event_pointer_get_absolute_x( pEisEvent ), eis_event_pointer_get_absolute_y( pEisEvent ), ++s_uSequence, true );
+                    wlserver_mousewarp( absX, absY, ++s_uSequence, true );
                     wlserver_unlock();
                 }
                 break;
 
                 case EIS_EVENT_BUTTON_BUTTON:
                 {
+                    s_nButtons++;
                     wlserver_lock();
                     wlserver_mousebutton( eis_event_button_get_button( pEisEvent ), eis_event_button_get_is_press( pEisEvent ), ++s_uSequence );
                     wlserver_unlock();
@@ -250,6 +265,17 @@ namespace gamescope
             }
 
             eis_event_unref( pEisEvent );
+        }
+
+        // [sunshine-diag] Периодический отчёт каждые 5 секунд
+        auto tNow = std::chrono::steady_clock::now();
+        auto nElapsed = std::chrono::duration_cast<std::chrono::seconds>( tNow - s_tLastReport ).count();
+        if ( nElapsed >= 5 && ( s_nRelMotion || s_nAbsMotion || s_nButtons || s_nKeys || s_nScroll ) )
+        {
+            gamescope_ei.infof( "[eis-diag] 5s: rel_motion=%u abs_motion=%u buttons=%u keys=%u scroll=%u",
+                s_nRelMotion, s_nAbsMotion, s_nButtons, s_nKeys, s_nScroll );
+            s_nRelMotion = s_nAbsMotion = s_nButtons = s_nKeys = s_nScroll = 0;
+            s_tLastReport = tNow;
         }
     }
 }

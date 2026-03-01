@@ -1252,7 +1252,16 @@ int32_t CVulkanDevice::findMemoryType( VkMemoryPropertyFlags properties, uint32_
 std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
 {
 	std::unique_ptr<CVulkanCmdBuffer> cmdBuffer;
-	if (m_unusedCmdBufs.empty())
+	{
+		std::lock_guard<std::mutex> lock(m_cmdBufMutex);
+		if (!m_unusedCmdBufs.empty())
+		{
+			cmdBuffer = std::move(m_unusedCmdBufs.back());
+			m_unusedCmdBufs.pop_back();
+		}
+	}
+
+	if (!cmdBuffer)
 	{
 		VkCommandBuffer rawCmdBuffer;
 		VkCommandBufferAllocateInfo commandBufferAllocateInfo = {
@@ -1270,11 +1279,6 @@ std::unique_ptr<CVulkanCmdBuffer> CVulkanDevice::commandBuffer()
 		}
 
 		cmdBuffer = std::make_unique<CVulkanCmdBuffer>(this, rawCmdBuffer, queue(), queueFamily());
-	}
-	else
-	{
-		cmdBuffer = std::move(m_unusedCmdBufs.back());
-		m_unusedCmdBufs.pop_back();
 	}
 
 	cmdBuffer->begin();
@@ -1337,6 +1341,7 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 		.pSignalSemaphores = pSignalSemaphores.data(),
 	};
 
+	// [thread-safety] QueueSubmit must be externally synchronized per Vulkan spec
 	vk_check( vk.QueueSubmit( cmdBuffer->queue(), 1, &submitInfo, VK_NULL_HANDLE ) );
 
 	return nextSeqNo;
@@ -1344,8 +1349,17 @@ uint64_t CVulkanDevice::submitInternal( CVulkanCmdBuffer* cmdBuffer )
 
 uint64_t CVulkanDevice::submit( std::unique_ptr<CVulkanCmdBuffer> cmdBuffer)
 {
+	std::lock_guard<std::mutex> lock(m_cmdBufMutex);
 	uint64_t nextSeqNo = submitInternal(cmdBuffer.get());
 	m_pendingCmdBufs.emplace(nextSeqNo, std::move(cmdBuffer));
+
+	// [diag] Логируем каждый 500-й submit для отслеживания роста map
+	static uint64_t s_nSubmitCount = 0;
+	if ( ++s_nSubmitCount % 500 == 0 )
+		fprintf(stderr, "[vk-diag] submit #%lu: seq=%lu pending=%zu thread=%lx\n",
+			(unsigned long)s_nSubmitCount, (unsigned long)nextSeqNo,
+			m_pendingCmdBufs.size(), (unsigned long)pthread_self());
+
 	return nextSeqNo;
 }
 
@@ -1354,6 +1368,14 @@ void CVulkanDevice::garbageCollect( void )
 	uint64_t currentSeqNo;
 	vk_check( vk.GetSemaphoreCounterValue(device(), m_scratchTimelineSemaphore, &currentSeqNo) );
 
+	// [diag] Логируем каждый 500-й GC
+	static uint64_t s_nGcCount = 0;
+	if ( ++s_nGcCount % 500 == 0 )
+		fprintf(stderr, "[vk-diag] garbageCollect #%lu: gpuSeq=%lu submitSeq=%lu thread=%lx\n",
+			(unsigned long)s_nGcCount, (unsigned long)currentSeqNo,
+			(unsigned long)m_submissionSeqNo, (unsigned long)pthread_self());
+
+	// resetCmdBuffers берёт m_cmdBufMutex внутри
 	resetCmdBuffers(currentSeqNo);
 }
 
@@ -1493,10 +1515,19 @@ void CVulkanDevice::wait(uint64_t sequence, bool reset)
 		.pValues = &sequence,
 	} ;
 
+	// [thread-safety] vkWaitSemaphores is thread-safe — NO mutex needed here
 	vk_check( vk.WaitSemaphores( device(), &waitInfo, ~0ull ) );
 
 	if (reset)
+	{
+		// [diag] Логируем каждый wait+reset
+		static uint64_t s_nWaitResetCount = 0;
+		if ( ++s_nWaitResetCount % 500 == 0 )
+			fprintf(stderr, "[vk-diag] wait+reset #%lu: seq=%lu thread=%lx\n",
+				(unsigned long)s_nWaitResetCount, (unsigned long)sequence,
+				(unsigned long)pthread_self());
 		resetCmdBuffers(sequence);
+	}
 }
 
 void CVulkanDevice::waitIdle(bool reset)
@@ -1506,14 +1537,60 @@ void CVulkanDevice::waitIdle(bool reset)
 
 void CVulkanDevice::resetCmdBuffers(uint64_t sequence)
 {
+	std::lock_guard<std::mutex> lock(m_cmdBufMutex);
+
 	auto last = m_pendingCmdBufs.find(sequence);
 	if (last == m_pendingCmdBufs.end())
 		return;
 
+	// [diag] Integrity check: проверяем дерево ДО итерации
+	{
+		size_t mapSize = m_pendingCmdBufs.size();
+		auto firstIt = m_pendingCmdBufs.begin();
+		uint64_t firstSeq = firstIt->first;
+		uint64_t lastSeq = last->first;
+
+		// Проверка: first <= target <= last элемент map
+		if ( firstSeq > lastSeq )
+		{
+			fprintf(stderr, "[vk-diag] CORRUPTION: firstSeq=%lu > lastSeq=%lu mapSize=%zu thread=%lx\n",
+				(unsigned long)firstSeq, (unsigned long)lastSeq,
+				mapSize, (unsigned long)pthread_self());
+			abort();
+		}
+
+		// Логируем каждый 500-й reset
+		static uint64_t s_nResetCount = 0;
+		if ( ++s_nResetCount % 500 == 0 )
+			fprintf(stderr, "[vk-diag] resetCmdBuffers #%lu: seq=%lu range=[%lu..%lu] mapSize=%zu thread=%lx\n",
+				(unsigned long)s_nResetCount, (unsigned long)sequence,
+				(unsigned long)firstSeq, (unsigned long)lastSeq,
+				mapSize, (unsigned long)pthread_self());
+	}
+
+	size_t nProcessed = 0;
 	for (auto it = m_pendingCmdBufs.begin(); ; it++)
 	{
-		it->second->reset();
-		m_unusedCmdBufs.push_back(std::move(it->second));
+		// [diag] Проверка на выход за пределы map
+		if ( it == m_pendingCmdBufs.end() )
+		{
+			fprintf(stderr, "[vk-diag] CORRUPTION: iterator hit end() before reaching last seq=%lu, processed=%zu thread=%lx\n",
+				(unsigned long)sequence, nProcessed, (unsigned long)pthread_self());
+			abort();
+		}
+
+		if (it->second)
+		{
+			it->second->reset();
+			m_unusedCmdBufs.push_back(std::move(it->second));
+		}
+		else
+		{
+			fprintf(stderr, "[vk-diag] WARNING: null cmd buffer at seq=%lu (target=%lu processed=%zu thread=%lx)\n",
+				(unsigned long)it->first, (unsigned long)sequence,
+				nProcessed, (unsigned long)pthread_self());
+		}
+		nProcessed++;
 		if (it == last)
 			break;
 	}
@@ -3553,16 +3630,10 @@ bool vulkan_init( VkInstance instance, VkSurfaceKHR surface )
 	return true;
 }
 
-gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb )
+gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, CVulkanTexture::createFlags texCreateFlags )
 {
 	gamescope::OwningRc<CVulkanTexture> pTex = new CVulkanTexture();
 
-	CVulkanTexture::createFlags texCreateFlags;
-	texCreateFlags.bSampled = true;
-
-	//fprintf(stderr, "pDMA->width: %d pDMA->height: %d pDMA->format: 0x%x pDMA->modifier: 0x%lx pDMA->n_planes: %d\n",
-	//	pDMA->width, pDMA->height, pDMA->format, pDMA->modifier, pDMA->n_planes);
-	
 	if ( pTex->BInit( pDMA->width, pDMA->height, 1u, pDMA->format, texCreateFlags, pDMA, 0, 0, nullptr, pBackendFb ) == false )
 		return nullptr;
 	
@@ -4231,8 +4302,244 @@ static void texture_destroy( struct wlr_texture *wlr_texture )
 	delete tex;
 }
 
+static uint32_t texture_preferred_read_format( struct wlr_texture *wlr_texture )
+{
+	// screencopy использует для определения SHM формата в capture_output()
+	return DRM_FORMAT_ARGB8888;
+}
+
 static const struct wlr_texture_impl texture_impl = {
+	.preferred_read_format = texture_preferred_read_format,
 	.destroy = texture_destroy,
+};
+
+// ─── Gamescope Render Pass для screencopy DMA-BUF copy ───
+
+struct GamescopeRenderPass {
+	struct wlr_render_pass base;
+	struct wlr_buffer *dst_buffer;                    // DMA-BUF от Sunshine
+	gamescope::OwningRc<CVulkanTexture> pDstTexture;  // imported dst VkImage
+	gamescope::OwningRc<CVulkanTexture> pSrcTexture;  // imported src VkImage
+	std::unique_ptr<CVulkanCmdBuffer> cmdBuffer;
+	bool bHasWork;
+};
+
+// Диагностическая функция: GPU readback 4 пикселей из текстуры → лог
+static void diag_readback_pixels( const char *label, gamescope::Rc<CVulkanTexture> tex )
+{
+	if ( !tex )
+	{
+		fprintf( stderr, "[screencopy] diag %s: texture is NULL\n", label );
+		return;
+	}
+
+	constexpr uint32_t kPixels = 4;   // читаем 4 пикселя
+	constexpr uint32_t kBPP    = 4;   // RGBA/XRGB = 4 bytes
+	constexpr VkDeviceSize kBufSize = kPixels * kBPP;
+
+	VkBufferCreateInfo bufCI = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size  = kBufSize,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	};
+	VkBuffer stagingBuf = VK_NULL_HANDLE;
+	VkResult res = g_device.vk.CreateBuffer( g_device.device(), &bufCI, nullptr, &stagingBuf );
+	if ( res != VK_SUCCESS )
+	{
+		fprintf( stderr, "[screencopy] diag %s: CreateBuffer failed (%d)\n", label, res );
+		return;
+	}
+
+	VkMemoryRequirements memReq;
+	g_device.vk.GetBufferMemoryRequirements( g_device.device(), stagingBuf, &memReq );
+
+	uint32_t memIdx = g_device.findMemoryType(
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		memReq.memoryTypeBits );
+	if ( memIdx == ~0u )
+	{
+		fprintf( stderr, "[screencopy] diag %s: no HOST_VISIBLE memory type\n", label );
+		g_device.vk.DestroyBuffer( g_device.device(), stagingBuf, nullptr );
+		return;
+	}
+
+	VkMemoryAllocateInfo allocCI = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize  = memReq.size,
+		.memoryTypeIndex = memIdx,
+	};
+	VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+	res = g_device.vk.AllocateMemory( g_device.device(), &allocCI, nullptr, &stagingMem );
+	if ( res != VK_SUCCESS )
+	{
+		fprintf( stderr, "[screencopy] diag %s: AllocateMemory failed (%d)\n", label, res );
+		g_device.vk.DestroyBuffer( g_device.device(), stagingBuf, nullptr );
+		return;
+	}
+	g_device.vk.BindBufferMemory( g_device.device(), stagingBuf, stagingMem, 0 );
+
+	// Readback command buffer: CopyImageToBuffer (4 пикселя из верхнего левого угла)
+	auto cmd = g_device.commandBuffer();
+
+	// Barrier: image → TRANSFER_SRC_OPTIMAL
+	VkImageMemoryBarrier imgBarrier = {
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = tex->vkImage(),
+		.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+	};
+	g_device.vk.CmdPipelineBarrier( cmd->rawBuffer(),
+		VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		0, 0, nullptr, 0, nullptr, 1, &imgBarrier );
+
+	VkBufferImageCopy region = {
+		.bufferOffset = 0,
+		.bufferRowLength = kPixels,
+		.bufferImageHeight = 1,
+		.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+		.imageOffset = { 0, 0, 0 },
+		.imageExtent = { kPixels, 1, 1 },
+	};
+	g_device.vk.CmdCopyImageToBuffer( cmd->rawBuffer(),
+		tex->vkImage(), VK_IMAGE_LAYOUT_GENERAL,
+		stagingBuf, 1, &region );
+
+	uint64_t seq = g_device.submit( std::move( cmd ) );
+	g_device.wait( seq );
+
+	// Map и прочитать
+	void *mapped = nullptr;
+	res = g_device.vk.MapMemory( g_device.device(), stagingMem, 0, kBufSize, 0, &mapped );
+	if ( res == VK_SUCCESS && mapped )
+	{
+		uint8_t *px = (uint8_t *)mapped;
+		fprintf( stderr, "[screencopy] diag %s: pixel[0]=%02x%02x%02x%02x pixel[1]=%02x%02x%02x%02x "
+			"pixel[2]=%02x%02x%02x%02x pixel[3]=%02x%02x%02x%02x\n",
+			label,
+			px[0], px[1], px[2], px[3],
+			px[4], px[5], px[6], px[7],
+			px[8], px[9], px[10], px[11],
+			px[12], px[13], px[14], px[15] );
+		g_device.vk.UnmapMemory( g_device.device(), stagingMem );
+	}
+	else
+	{
+		fprintf( stderr, "[screencopy] diag %s: MapMemory failed (%d)\n", label, res );
+	}
+
+	g_device.vk.DestroyBuffer( g_device.device(), stagingBuf, nullptr );
+	g_device.vk.FreeMemory( g_device.device(), stagingMem, nullptr );
+}
+
+static bool render_pass_submit( struct wlr_render_pass *wlr_pass )
+{
+	static int s_nSubmitCount = 0;
+	s_nSubmitCount++;
+
+	auto *pass = (GamescopeRenderPass *)wlr_pass;
+	bool ok = false;
+
+	if ( pass->bHasWork && pass->cmdBuffer )
+	{
+		uint64_t seq = g_device.submit( std::move( pass->cmdBuffer ) );
+		g_device.wait( seq );
+		ok = true;
+		if ( s_nSubmitCount <= 5 || s_nSubmitCount % 100 == 0 )
+			fprintf( stderr, "[screencopy] submit #%d: GPU copy OK (seq=%lu)\n", s_nSubmitCount, (unsigned long)seq );
+
+		// Pixel readback — src и dst (только первые 3 кадра)
+		if ( s_nSubmitCount <= 3 )
+		{
+			diag_readback_pixels( "SRC", pass->pSrcTexture );
+			diag_readback_pixels( "DST", pass->pDstTexture );
+		}
+	}
+	else
+	{
+		fprintf( stderr, "[screencopy] submit #%d: NO WORK! bHasWork=%d cmdBuffer=%p\n",
+			s_nSubmitCount, pass->bHasWork, pass->cmdBuffer.get() );
+	}
+
+	delete pass;
+	return ok;
+}
+
+static void render_pass_add_texture( struct wlr_render_pass *wlr_pass,
+	const struct wlr_render_texture_options *options )
+{
+	static int s_nAddCount = 0;
+	s_nAddCount++;
+
+	auto *pass = (GamescopeRenderPass *)wlr_pass;
+	VulkanWlrTexture_t *src_wlr_tex = (VulkanWlrTexture_t *)options->texture;
+
+	if ( !src_wlr_tex || !src_wlr_tex->buf )
+	{
+		fprintf( stderr, "[screencopy] add_texture: src texture or buffer is NULL\n" );
+		return;
+	}
+
+	// Попробовать использовать оригинальный VkImage из GBMSlot (без re-import)
+	gamescope::Rc<CVulkanTexture> pSrcTex;
+	const char *srcMethod = "cached";
+
+	if ( src_wlr_tex->cachedVulkanTex )
+	{
+		pSrcTex = src_wlr_tex->cachedVulkanTex;
+	}
+	else
+	{
+		// Fallback: re-import DMA-BUF (может дать чёрный экран на NVIDIA tiled)
+		struct wlr_dmabuf_attributes src_dmabuf = {};
+		if ( !wlr_buffer_get_dmabuf( src_wlr_tex->buf, &src_dmabuf ) )
+		{
+			fprintf( stderr, "[screencopy] add_texture: src buffer is not DMA-BUF\n" );
+			return;
+		}
+		CVulkanTexture::createFlags srcFlags;
+		srcFlags.bSampled = true;
+		srcFlags.bTransferSrc = true;
+		pSrcTex = vulkan_create_texture_from_dmabuf( &src_dmabuf, nullptr, srcFlags );
+		srcMethod = "re-import";
+		if ( !pSrcTex )
+		{
+			fprintf( stderr, "[screencopy] add_texture: failed to import src DMA-BUF fd=%d\n", src_dmabuf.fd[0] );
+			return;
+		}
+	}
+
+	if ( s_nAddCount <= 5 || s_nAddCount % 100 == 0 )
+		fprintf( stderr, "[screencopy] add_texture #%d: srcTex=%p vkImage=%p %ux%u -> dstTex %ux%u (method=%s)\n",
+			s_nAddCount,
+			(void*)pSrcTex.get(), (void*)pSrcTex->vkImage(),
+			pSrcTex->width(), pSrcTex->height(),
+			pass->pDstTexture->width(), pass->pDstTexture->height(),
+			srcMethod );
+
+	pass->pSrcTexture = pSrcTex;
+
+	// vkCmdCopyImage: src -> dst (both in VRAM, zero-copy)
+	pass->cmdBuffer->copyImage( pSrcTex, pass->pDstTexture );
+	pass->bHasWork = true;
+}
+
+static void render_pass_add_rect( struct wlr_render_pass *wlr_pass,
+	const struct wlr_render_rect_options *options )
+{
+	// screencopy не вызывает add_rect, но wlr_render_pass_init assert требует
+	(void)wlr_pass;
+	(void)options;
+}
+
+static const struct wlr_render_pass_impl gamescope_render_pass_impl = {
+	.submit = render_pass_submit,
+	.add_texture = render_pass_add_texture,
+	.add_rect = render_pass_add_rect,
 };
 
 static const struct wlr_drm_format_set *renderer_get_texture_formats( struct wlr_renderer *wlr_renderer, uint32_t buffer_caps )
@@ -4261,18 +4568,79 @@ static struct wlr_texture *renderer_texture_from_buffer( struct wlr_renderer *wl
 	VulkanWlrTexture_t *tex = new VulkanWlrTexture_t();
 	wlr_texture_init( &tex->base, wlr_renderer, &texture_impl, buf->width, buf->height );
 	tex->buf = wlr_buffer_lock( buf );
-	// TODO: check format/modifier
-	// TODO: if DMA-BUF, try importing it into Vulkan
+
+	// Попробовать кешировать оригинальный VkImage из GBMSlot
+	tex->cachedVulkanTex = gamescope::sunshine_get_buffer_vulkan_tex( buf );
+
 	return &tex->base;
 }
 
 static struct wlr_render_pass *renderer_begin_buffer_pass( struct wlr_renderer *renderer, struct wlr_buffer *buffer, const struct wlr_buffer_pass_options *options )
 {
-	abort(); // unreachable
+	static int s_nCallCount = 0;
+	s_nCallCount++;
+
+	// Throttle screencopy до x2 от refresh rate (~8ms min interval).
+	// Предотвращает burst запросов от Sunshine, вызывающий race condition
+	// в GBM bo lifecycle → EGL_BAD_PARAMETER → чёрный экран.
+	{
+		static auto s_tLastPass = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+		constexpr auto kMinInterval = std::chrono::milliseconds( 8 ); // ~120 fps cap
+
+		auto tNow = std::chrono::steady_clock::now();
+		auto tElapsed = tNow - s_tLastPass;
+		if ( tElapsed < kMinInterval )
+		{
+			auto tSleep = kMinInterval - tElapsed;
+			if ( s_nCallCount <= 5 || s_nCallCount % 100 == 0 )
+				fprintf( stderr, "[screencopy] throttle: sleeping %lld ms\n",
+					(long long)std::chrono::duration_cast<std::chrono::milliseconds>( tSleep ).count() );
+			std::this_thread::sleep_for( tSleep );
+		}
+		s_tLastPass = std::chrono::steady_clock::now();
+	}
+
+	// Import dst (Sunshine) DMA-BUF → CVulkanTexture
+	struct wlr_dmabuf_attributes dmabuf = {};
+	if ( !wlr_buffer_get_dmabuf( buffer, &dmabuf ) )
+	{
+		fprintf( stderr, "[screencopy] begin_buffer_pass: dst buffer is not DMA-BUF\n" );
+		return NULL;
+	}
+
+	if ( s_nCallCount <= 5 || s_nCallCount % 100 == 0 )
+		fprintf( stderr, "[screencopy] begin_buffer_pass #%d: dst fd=%d %ux%u fmt=0x%x mod=0x%lx stride=%u\n",
+			s_nCallCount, dmabuf.fd[0], dmabuf.width, dmabuf.height, dmabuf.format, (unsigned long)dmabuf.modifier, dmabuf.stride[0] );
+
+	CVulkanTexture::createFlags dstFlags;
+	dstFlags.bSampled = true;
+	dstFlags.bTransferDst = true;
+	auto pDstTex = vulkan_create_texture_from_dmabuf( &dmabuf, nullptr, dstFlags );
+	if ( !pDstTex )
+	{
+		fprintf( stderr, "[screencopy] begin_buffer_pass: failed to import dst DMA-BUF\n" );
+		return NULL;
+	}
+
+	auto *pass = new GamescopeRenderPass();
+	wlr_render_pass_init( &pass->base, &gamescope_render_pass_impl );
+	pass->dst_buffer = buffer;
+	pass->pDstTexture = pDstTex;
+	pass->cmdBuffer = g_device.commandBuffer();
+	pass->bHasWork = false;
+
+	return &pass->base;
+}
+
+static const struct wlr_drm_format_set *renderer_get_render_formats( struct wlr_renderer *wlr_renderer )
+{
+	// Render formats для swapchain creation — те же DMA-BUF форматы что renderer поддерживает
+	return &sampledDRMFormats;
 }
 
 static const struct wlr_renderer_impl renderer_impl = {
 	.get_texture_formats = renderer_get_texture_formats,
+	.get_render_formats = renderer_get_render_formats,
 	.get_drm_fd = renderer_get_drm_fd,
 	.texture_from_buffer = renderer_texture_from_buffer,
 	.begin_buffer_pass = renderer_begin_buffer_pass,
@@ -4291,7 +4659,9 @@ gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struc
 	struct wlr_dmabuf_attributes dmabuf = {0};
 	if ( wlr_buffer_get_dmabuf( buf, &dmabuf ) )
 	{
-		return vulkan_create_texture_from_dmabuf( &dmabuf, pBackendFb );
+		CVulkanTexture::createFlags wlrFlags;
+		wlrFlags.bSampled = true;
+		return vulkan_create_texture_from_dmabuf( &dmabuf, pBackendFb, wlrFlags );
 	}
 
 	VkResult result;

@@ -44,6 +44,7 @@ namespace gamescope
 
         std::span<GamescopeFeature> GetFeatures() { return std::span<GamescopeFeature>{ m_Features }; }
         const std::optional<GamescopeActiveDisplayInfo> &GetActiveDisplayInfo() { return m_ActiveDisplayInfo; }
+        bool SetMode( uint32_t width, uint32_t height, uint32_t refresh_mhz );
     private:
         bool m_bInitControl = false;
         bool m_bInitPrivate = false;
@@ -56,6 +57,10 @@ namespace gamescope
 
         std::vector<GamescopeFeature> m_Features;
         std::optional<GamescopeActiveDisplayInfo> m_ActiveDisplayInfo;
+        bool m_bModeChanged = false;
+        uint32_t m_uNewWidth = 0;
+        uint32_t m_uNewHeight = 0;
+        uint32_t m_uNewRefreshMhz = 0;
 
         void Wayland_Registry_Global( wl_registry *pRegistry, uint32_t uName, const char *pInterface, uint32_t uVersion );
         static const wl_registry_listener s_RegistryListener;
@@ -63,6 +68,8 @@ namespace gamescope
         void Wayland_GamescopeControl_FeatureSupport( gamescope_control *pGamescopeControl, uint32_t uFeature, uint32_t uVersion, uint32_t uFlags );
         void Wayland_GamescopeControl_ActiveDisplayInfo( gamescope_control *pGamescopeControl, const char *pConnectorName, const char *pDisplayMake, const char *pDisplayModel, uint32_t uDisplayFlags, wl_array *pValidRefreshRatesArray );
         void Wayland_GamescopeControl_ScreenshotTaken( gamescope_control *pGamescopeControl, const char *pPath );
+        void Wayland_GamescopeControl_ModeChanged( gamescope_control *pGamescopeControl, uint32_t uWidth, uint32_t uHeight, uint32_t uRefreshMhz );
+        void Wayland_GamescopeControl_AppPerfStats( gamescope_control *pGamescopeControl, uint32_t uAppId, uint32_t uFrametimeLo, uint32_t uFrametimeHi );
         static const gamescope_control_listener s_GamescopeControlListener;
 
         void Wayland_GamescopePrivate_Log( gamescope_private *pGamescopePrivate, const char *pText );
@@ -186,12 +193,49 @@ namespace gamescope
     {
         fprintf( stderr, "Screenshot taken to: %s\n", pPath );
     }
+    void GamescopeCtl::Wayland_GamescopeControl_ModeChanged( gamescope_control *pGamescopeControl, uint32_t uWidth, uint32_t uHeight, uint32_t uRefreshMhz )
+    {
+        m_bModeChanged = true;
+        m_uNewWidth = uWidth;
+        m_uNewHeight = uHeight;
+        m_uNewRefreshMhz = uRefreshMhz;
+    }
+    void GamescopeCtl::Wayland_GamescopeControl_AppPerfStats( gamescope_control *pGamescopeControl, uint32_t uAppId, uint32_t uFrametimeLo, uint32_t uFrametimeHi )
+    {
+        // Не используется в CLI
+    }
+
+    bool GamescopeCtl::SetMode( uint32_t width, uint32_t height, uint32_t refresh_mhz )
+    {
+        if ( !m_pGamescopeControl )
+        {
+            fprintf( stderr, "gamescope_control not available\n" );
+            return false;
+        }
+
+        m_bModeChanged = false;
+        gamescope_control_set_output_mode( m_pGamescopeControl, width, height, refresh_mhz );
+        wl_display_roundtrip( m_pDisplay );
+
+        if ( m_bModeChanged )
+        {
+            fprintf( stdout, "Mode changed: %ux%u @ %u mHz\n", m_uNewWidth, m_uNewHeight, m_uNewRefreshMhz );
+            return true;
+        }
+        else
+        {
+            fprintf( stderr, "Mode change not confirmed by compositor\n" );
+            return false;
+        }
+    }
 
     const gamescope_control_listener GamescopeCtl::s_GamescopeControlListener =
     {
         .feature_support     = WAYLAND_USERDATA_TO_THIS( GamescopeCtl, Wayland_GamescopeControl_FeatureSupport ),
         .active_display_info = WAYLAND_USERDATA_TO_THIS( GamescopeCtl, Wayland_GamescopeControl_ActiveDisplayInfo ),
         .screenshot_taken    = WAYLAND_USERDATA_TO_THIS( GamescopeCtl, Wayland_GamescopeControl_ScreenshotTaken ),
+        .app_performance_stats = WAYLAND_USERDATA_TO_THIS( GamescopeCtl, Wayland_GamescopeControl_AppPerfStats ),
+        .mode_changed        = WAYLAND_USERDATA_TO_THIS( GamescopeCtl, Wayland_GamescopeControl_ModeChanged ),
     };
 
     void GamescopeCtl::Wayland_GamescopePrivate_Log( gamescope_private *pGamescopePrivate, const char *pText )
@@ -235,6 +279,28 @@ namespace gamescope
     {
         console_log.bPrefixEnabled = false;
 
+        // Проверяем set-mode команду
+        if ( argc >= 2 && std::string_view{ argv[1] } == "set-mode" )
+        {
+            if ( argc < 5 )
+            {
+                fprintf( stderr, "Usage: gamescopectl set-mode <width> <height> <fps>\n" );
+                fprintf( stderr, "Example: gamescopectl set-mode 1920 1080 60\n" );
+                return 1;
+            }
+
+            gamescope::GamescopeCtl gamescopeCtl;
+            if ( !gamescopeCtl.Init( true, false ) )
+                return 1;
+
+            uint32_t width = std::stoul( argv[2] );
+            uint32_t height = std::stoul( argv[3] );
+            uint32_t fps = std::stoul( argv[4] );
+            uint32_t refresh_mhz = fps * 1000;
+
+            return gamescopeCtl.SetMode( width, height, refresh_mhz ) ? 0 : 1;
+        }
+
         bool bInfoOnly = argc < 2;
 
         gamescope::GamescopeCtl gamescopeCtl;
@@ -267,8 +333,10 @@ namespace gamescope
                 std::string_view szFeatureName = GetFeatureName( feature.eFeature );
                 fprintf( stdout, "  - %.*s (%u) - Version: %u - Flags: 0x%x\n", (int)szFeatureName.size(), szFeatureName.data(), uint32_t{ feature.eFeature }, feature.uVersion, feature.uFlags );
             }
-            fprintf( stdout, "You can execute any debug command in Gamescope using this tool.\n" );
-            fprintf( stdout, "For a list of commands and convars, use 'gamescopectl help'\n" );
+            fprintf( stdout, "\nAvailable commands:\n" );
+            fprintf( stdout, "  set-mode <width> <height> <fps>  - Set output resolution and frame rate\n" );
+            fprintf( stdout, "  <convar> [value]                 - Execute any debug command\n" );
+            fprintf( stdout, "\nFor a list of commands and convars, use 'gamescopectl help'\n" );
             return 0;
         }
 

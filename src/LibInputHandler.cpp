@@ -1,9 +1,13 @@
 #include "LibInputHandler.h"
+#include "InputDeviceDBus.h"
 
 #include <libinput.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <poll.h>
+#include <chrono>
+#include <map>
+#include <string>
 
 #include "log.hpp"
 #include "backend.h"
@@ -93,7 +97,25 @@ namespace gamescope
     {
         static uint32_t s_uSequence = 0;
 
+        // [libinput-diag] Счётчики по устройствам
+        struct DevStats { uint32_t rel = 0; uint32_t abs = 0; };
+        static std::map<std::string, DevStats> s_devStats;
+        static auto s_tLastReport = std::chrono::steady_clock::now();
+
         libinput_dispatch( m_pLibInput );
+
+        // [sunshine] Input oversampling x2:
+        // Mouse motion → lockfree atomic (VBlank timer забирает каждые 8ms).
+        // Buttons/keys/scroll → batched с lock (не теряем дискретные события).
+        double flAccumDx = 0.0, flAccumDy = 0.0;
+        bool bHasMotion = false;
+        double flAbsX = 0.0, flAbsY = 0.0;
+        bool bHasAbsMotion = false;
+
+        struct ButtonEvent { uint32_t button; bool pressed; };
+        struct KeyEvent { uint32_t key; bool pressed; };
+        std::vector<ButtonEvent> buttons;
+        std::vector<KeyEvent> keys;
 
 		while ( libinput_event *pEvent = libinput_get_event( m_pLibInput ) )
         {
@@ -101,54 +123,61 @@ namespace gamescope
 
             libinput_event_type eEventType = libinput_event_get_type( pEvent );
 
+            // [libinput-diag] Имя устройства для pointer events
+            if ( eEventType == LIBINPUT_EVENT_POINTER_MOTION ||
+                 eEventType == LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE )
+            {
+                libinput_device *pDev = libinput_event_get_device( pEvent );
+                const char *pName = pDev ? libinput_device_get_name( pDev ) : "unknown";
+                std::string sName( pName ? pName : "unknown" );
+                if ( eEventType == LIBINPUT_EVENT_POINTER_MOTION )
+                    s_devStats[sName].rel++;
+                else
+                    s_devStats[sName].abs++;
+            }
+
             switch ( eEventType )
             {
                 case LIBINPUT_EVENT_POINTER_MOTION:
                 {
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
-
-                    double flDx = libinput_event_pointer_get_dx( pPointerEvent );
-                    double flDy = libinput_event_pointer_get_dy( pPointerEvent );
-
-                    GetBackend()->NotifyPhysicalInput( InputType::Mouse );
-
-                    wlserver_lock();
-                    wlserver_mousemotion( flDx, flDy, ++s_uSequence );
-                    wlserver_unlock();
+                    flAccumDx += libinput_event_pointer_get_dx( pPointerEvent );
+                    flAccumDy += libinput_event_pointer_get_dy( pPointerEvent );
+                    bHasMotion = true;
                 }
                 break;
 
                 case LIBINPUT_EVENT_POINTER_MOTION_ABSOLUTE:
                 {
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
-
-                    double flX = libinput_event_pointer_get_absolute_x( pPointerEvent );
-                    double flY = libinput_event_pointer_get_absolute_y( pPointerEvent );
-
-                    GetBackend()->NotifyPhysicalInput( InputType::Mouse );
-
-                    wlserver_lock();
-                    wlserver_mousewarp( flX, flY, ++s_uSequence, true );
-                    wlserver_unlock();
+                    flAbsX = libinput_event_pointer_get_absolute_x( pPointerEvent );
+                    flAbsY = libinput_event_pointer_get_absolute_y( pPointerEvent );
+                    bHasAbsMotion = true;
                 }
                 break;
 
                 case LIBINPUT_EVENT_POINTER_BUTTON:
                 {
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
-
                     uint32_t uButton = libinput_event_pointer_get_button( pPointerEvent );
                     libinput_button_state eButtonState = libinput_event_pointer_get_button_state( pPointerEvent );
-
-                    wlserver_lock();
-                    wlserver_mousebutton( uButton, eButtonState == LIBINPUT_BUTTON_STATE_PRESSED, ++s_uSequence );
-                    wlserver_unlock();
+                    buttons.push_back( { uButton, eButtonState == LIBINPUT_BUTTON_STATE_PRESSED } );
                 }
                 break;
 
                 case LIBINPUT_EVENT_POINTER_SCROLL_WHEEL:
                 {
                     libinput_event_pointer *pPointerEvent = libinput_event_get_pointer_event( pEvent );
+
+                    // Получаем scrollFactor для этого устройства
+                    double flFactor = 1.0;
+                    if ( m_pDBus )
+                    {
+                        libinput_device *pDev = libinput_event_get_device( pEvent );
+                        const char *pszSysName = pDev ? libinput_device_get_sysname( pDev ) : nullptr;
+                        if ( pszSysName )
+                            flFactor = m_pDBus->GetScrollFactor( pszSysName );
+                    }
 
                     static constexpr libinput_pointer_axis eAxes[] =
                     {
@@ -159,12 +188,10 @@ namespace gamescope
                     for ( uint32_t i = 0; i < std::size( eAxes ); i++ )
                     {
                         libinput_pointer_axis eAxis = eAxes[i];
-
                         if ( !libinput_event_pointer_has_axis( pPointerEvent, eAxis ) )
                             continue;
-
                         double flScroll = libinput_event_pointer_get_scroll_value_v120( pPointerEvent, eAxis );
-                        m_flScrollAccum[i] += flScroll / 120.0;
+                        m_flScrollAccum[i] += ( flScroll / 120.0 ) * flFactor;
                     }
                 }
                 break;
@@ -174,10 +201,23 @@ namespace gamescope
                     libinput_event_keyboard *pKeyboardEvent = libinput_event_get_keyboard_event( pEvent );
                     uint32_t uKey = libinput_event_keyboard_get_key( pKeyboardEvent );
                     libinput_key_state eState = libinput_event_keyboard_get_key_state( pKeyboardEvent );
+                    keys.push_back( { uKey, eState == LIBINPUT_KEY_STATE_PRESSED } );
+                }
+                break;
 
-                    wlserver_lock();
-                wlserver_key( uKey, eState == LIBINPUT_KEY_STATE_PRESSED, ++    s_uSequence );
-                    wlserver_unlock();
+                case LIBINPUT_EVENT_DEVICE_ADDED:
+                {
+                    libinput_device *pDev = libinput_event_get_device( pEvent );
+                    if ( m_pDBus )
+                        m_pDBus->OnDeviceAdded( pDev );
+                }
+                break;
+
+                case LIBINPUT_EVENT_DEVICE_REMOVED:
+                {
+                    libinput_device *pDev = libinput_event_get_device( pEvent );
+                    if ( m_pDBus )
+                        m_pDBus->OnDeviceRemoved( pDev );
                 }
                 break;
 
@@ -186,19 +226,68 @@ namespace gamescope
             }
 		}
 
-        // Handle scrolling
+        // [sunshine] Direct path: motion → KWin напрямую.
+        // Задержка ~0.3ms вместо ~9ms (было: atomic → VBlank Timer batch → flush).
+        // BT-мышь на клиенте была реальной причиной зависания, а не частота events.
+        if ( bHasMotion )
         {
-            double flScrollX = m_flScrollAccum[0];
-            double flScrollY = m_flScrollAccum[1];
-            m_flScrollAccum[0] = 0.0;
-            m_flScrollAccum[1] = 0.0;
+            GetBackend()->NotifyPhysicalInput( InputType::Mouse );
 
-            if ( flScrollX != 0.0 || flScrollY != 0.0 )
+            wlserver_lock();
+            wlserver_mousemotion( flAccumDx, flAccumDy, ++s_uSequence );
+            wlserver_unlock();
+        }
+
+        // Abs motion: прямой вызов wlserver_mousewarp
+        if ( bHasAbsMotion )
+        {
+            GetBackend()->NotifyPhysicalInput( InputType::Mouse );
+
+            wlserver_lock();
+            wlserver_mousewarp( flAbsX, flAbsY, ++s_uSequence, true );
+            wlserver_unlock();
+        }
+
+        // [sunshine] Discrete events (buttons, keys, scroll): batched с lock.
+        // Эти события нельзя терять — каждое press/release значимо.
+        bool bHasDiscreteInput = !buttons.empty() || !keys.empty()
+            || m_flScrollAccum[0] != 0.0 || m_flScrollAccum[1] != 0.0;
+
+        if ( bHasDiscreteInput )
+        {
+            wlserver_lock();
+
+            for ( auto &btn : buttons )
+                wlserver_mousebutton( btn.button, btn.pressed, ++s_uSequence );
+
+            for ( auto &key : keys )
+                wlserver_key( key.key, key.pressed, ++s_uSequence );
+
+            if ( m_flScrollAccum[0] != 0.0 || m_flScrollAccum[1] != 0.0 )
             {
-                wlserver_lock();
-                wlserver_mousewheel( flScrollX, flScrollY, ++s_uSequence );
-                wlserver_unlock();
+                wlserver_mousewheel( m_flScrollAccum[0], m_flScrollAccum[1], ++s_uSequence );
+                m_flScrollAccum[0] = 0.0;
+                m_flScrollAccum[1] = 0.0;
             }
+
+            wlserver_unlock();
+        }
+
+        // [libinput-diag] Периодический отчёт каждые 5 секунд
+        auto tNow = std::chrono::steady_clock::now();
+        auto nElapsed = std::chrono::duration_cast<std::chrono::seconds>( tNow - s_tLastReport ).count();
+        if ( nElapsed >= 5 && !s_devStats.empty() )
+        {
+            for ( auto &[name, stats] : s_devStats )
+            {
+                if ( stats.rel > 0 || stats.abs > 0 )
+                {
+                    log_input_stealer.infof( "[libinput-diag] 5s '%s': rel=%u abs=%u",
+                        name.c_str(), stats.rel, stats.abs );
+                }
+            }
+            s_devStats.clear();
+            s_tLastReport = tNow;
         }
     }
 }

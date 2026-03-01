@@ -191,6 +191,7 @@ const char usage[] =
 #endif
 	"                                     headless => use headless backend (no window, no DRM output)\n"
 	"                                     wayland => use Wayland backend\n"
+	"                                     sunshine => use Sunshine backend (cloud desktop streaming)\n"
 	"  --cursor                       path to default cursor image\n"
 	"  -R, --ready-fd                 notify FD when ready\n"
 	"  --rt                           Use realtime scheduling\n"
@@ -436,6 +437,8 @@ static enum gamescope::GamescopeBackend parse_backend_name(const char *str)
 		return gamescope::GamescopeBackend::Headless;
 	} else if (strcmp(str, "wayland") == 0) {
 		return gamescope::GamescopeBackend::Wayland;
+	} else if (strcmp(str, "sunshine") == 0) {
+		return gamescope::GamescopeBackend::Sunshine;
 	} else {
 		fprintf( stderr, "gamescope: invalid value for --backend\n" );
 		exit(1);
@@ -938,6 +941,10 @@ int main(int argc, char **argv)
 			if ( !GetBackend() )
 				gamescope::IBackend::Set<gamescope::CSDLBackend>();
 #endif
+			break;
+
+		case gamescope::GamescopeBackend::Sunshine:
+			gamescope::IBackend::Set<gamescope::CSunshineBackend>();
 			break;
 		default:
 			abort();

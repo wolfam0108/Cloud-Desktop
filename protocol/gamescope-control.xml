@@ -29,7 +29,7 @@
     it.
   </description>
 
-  <interface name="gamescope_control" version="6">
+  <interface name="gamescope_control" version="7">
     <request name="destroy" type="destructor"></request>
 
     <enum name="feature">
@@ -141,6 +141,26 @@
       <arg name="app_id" type="uint" summary="Appid for this request"></arg>
       <arg name="frametime_ns_lo" type="uint" summary="Time delta between the two most recent frames"></arg>
       <arg name="frametime_ns_hi" type="uint" summary="frametime_ns high bits"></arg>
+    </event>
+
+    <request name="set_output_mode" since="7">
+      <description summary="Set the output resolution and refresh rate">
+        Dynamically changes the output mode of the compositor.
+        The compositor will recreate internal buffers, update wlr_output mode,
+        and send a mode_changed event upon completion.
+      </description>
+      <arg name="width" type="uint" summary="Output width in pixels"></arg>
+      <arg name="height" type="uint" summary="Output height in pixels"></arg>
+      <arg name="refresh_mhz" type="uint" summary="Refresh rate in millihertz (e.g. 60000 for 60Hz)"></arg>
+    </request>
+
+    <event name="mode_changed" since="7">
+      <description summary="Output mode has been changed">
+        Sent after a successful mode change triggered by set_output_mode.
+      </description>
+      <arg name="width" type="uint" summary="New output width in pixels"></arg>
+      <arg name="height" type="uint" summary="New output height in pixels"></arg>
+      <arg name="refresh_mhz" type="uint" summary="New refresh rate in millihertz"></arg>
     </event>
 
   </interface>
