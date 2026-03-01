@@ -25,12 +25,13 @@ sdl2_dep = dependency('SDL2', required: get_option('sdl2_backend'))
 avif_dep = dependency('libavif', version: '>=1.0.0', required: get_option('avif_screenshots'))
 pixman_dep = dependency('pixman-1')
 udev_dep = dependency('libudev')
+gbm_dep = dependency('gbm')
 
 wlroots_dep = dependency(
   'wlroots-0.18',
   version: ['>= 0.18.0', '< 0.19.0'],
   fallback: 'wlroots',
-  default_options: ['default_library=static', 'examples=false', 'xwayland=enabled', 'backends=libinput', 'renderers=[]', 'allocators=[]', 'session=enabled'],
+  default_options: ['default_library=static', 'examples=false', 'xwayland=enabled', 'backends=libinput', 'renderers=[]', 'allocators=gbm', 'session=enabled'],
 )
 
 displayinfo_dep = dependency(
@@ -98,6 +99,7 @@ required_wlroots_features = ['xwayland']
 
 src = [
   'Backends/HeadlessBackend.cpp',
+  'Backends/SunshineBackend.cpp',
   'Backends/WaylandBackend.cpp',
   'Utils/TempFiles.cpp',
   'Utils/Version.cpp',
@@ -122,6 +124,7 @@ src = [
   'x11cursor.cpp',
   'InputEmulation.cpp',
   'LibInputHandler.cpp',
+  'InputDeviceDBus.cpp',
 ]
 
 luajit_dep = dependency( 'luajit' )
@@ -199,7 +202,7 @@ gamescope_version = configure_file(
       xkbcommon, thread_dep, sdl2_dep, wlroots_dep,
       vulkan_dep, liftoff_dep, dep_xtst, dep_xmu, cap_dep, epoll_dep, pipewire_dep, librt_dep,
       stb_dep, displayinfo_dep, openvr_dep, dep_xcursor, avif_dep, dep_xi,
-      libdecor_dep, eis_dep, luajit_dep, libinput_dep, libsystemd_dep, pixman_dep, udev_dep,
+      libdecor_dep, eis_dep, luajit_dep, libinput_dep, libsystemd_dep, pixman_dep, udev_dep, gbm_dep,
     ],
     install: true,
     cpp_args: gamescope_cpp_args,

@@ -11,6 +11,7 @@ namespace gamescope
         OpenVR,
         Headless,
         Wayland,
+        Sunshine,
     };
 
     // Backend forward declarations.
@@ -19,4 +20,5 @@ namespace gamescope
     class COpenVRBackend;
     class CHeadlessBackend;
     class CWaylandBackend;
+    class CSunshineBackend;
 }

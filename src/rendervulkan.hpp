@@ -79,11 +79,17 @@ struct VulkanRenderer_t
 	struct wlr_renderer base;
 };
 
+class CVulkanTexture;  // forward declaration
+
 struct VulkanWlrTexture_t
 {
 	struct wlr_texture base;
 	struct wlr_buffer *buf;
+	CVulkanTexture *cachedVulkanTex = nullptr;  // оригинальный VkImage из GBMSlot (без re-import)
 };
+
+// Извлечь оригинальный CVulkanTexture из GBMSlot wlr_buffer (SunshineBackend.cpp)
+namespace gamescope { CVulkanTexture *sunshine_get_buffer_vulkan_tex( struct wlr_buffer *buf ); }
 
 inline VkFormat ToSrgbVulkanFormat( VkFormat format )
 {
@@ -404,7 +410,7 @@ bool vulkan_init(VkInstance instance, VkSurfaceKHR surface);
 bool vulkan_init_formats(void);
 bool vulkan_make_output();
 
-gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
+gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_dmabuf( struct wlr_dmabuf_attributes *pDMA, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb, CVulkanTexture::createFlags texCreateFlags = {} );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_bits( uint32_t width, uint32_t height, uint32_t contentWidth, uint32_t contentHeight, uint32_t drmFormat, CVulkanTexture::createFlags texCreateFlags, void *bits );
 gamescope::OwningRc<CVulkanTexture> vulkan_create_texture_from_wlr_buffer( struct wlr_buffer *buf, gamescope::OwningRc<gamescope::IBackendFb> pBackendFb );
 
@@ -682,6 +688,7 @@ static inline uint32_t div_roundup(uint32_t x, uint32_t y)
 	VK_FUNC(CmdClearColorImage) \
 	VK_FUNC(CmdCopyBufferToImage) \
 	VK_FUNC(CmdCopyImage) \
+	VK_FUNC(CmdCopyImageToBuffer) \
 	VK_FUNC(CmdDispatch) \
 	VK_FUNC(CmdDraw) \
 	VK_FUNC(CmdEndRendering) \
@@ -892,6 +899,7 @@ protected:
 
 	VkSemaphore m_scratchTimelineSemaphore;
 	std::atomic<uint64_t> m_submissionSeqNo = { 0 };
+	std::mutex m_cmdBufMutex; // Защита m_unusedCmdBufs, m_pendingCmdBufs, QueueSubmit
 	std::vector<std::unique_ptr<CVulkanCmdBuffer>> m_unusedCmdBufs;
 	std::map<uint64_t, std::unique_ptr<CVulkanCmdBuffer>> m_pendingCmdBufs;
 };

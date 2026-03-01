@@ -53,6 +53,7 @@
 #include <filesystem>
 #include <variant>
 #include <unordered_set>
+#include <chrono>
 
 #include <assert.h>
 #include <stdlib.h>
@@ -912,6 +913,11 @@ uint32_t		inputCounter;
 uint32_t		lastPublishedInputCounter;
 
 std::atomic<bool> hasRepaint = false;
+
+// [sunshine] PPM dump по запросу от cursor test.
+// Каждый dump записывает файл с указанным именем.
+std::atomic<int> g_nSunshineDumpRequest{0};
+char g_szSunshineDumpName[128] = {};
 bool			hasRepaintNonBasePlane = false;
 
 bool			g_bUpdateForwardedVROverlays = false;
@@ -2231,6 +2237,18 @@ paint_window(steamcompmgr_win_t *w, steamcompmgr_win_t *scaleW, struct FrameInfo
 	if ( w )
 		get_window_last_done_commit( w, lastCommit );
 
+	// [sunshine] Диагностика paint_window — какой tex используется
+	static int s_nPaintDiag = 0;
+	s_nPaintDiag++;
+	if ( s_nPaintDiag <= 10 || s_nPaintDiag % 200 == 0 )
+	{
+		void *lastTex = lastCommit ? (void*)lastCommit->vulkanTex->vkImage() : nullptr;
+		void *heldTex = g_HeldCommits[HELD_COMMIT_BASE] ? (void*)g_HeldCommits[HELD_COMMIT_BASE]->vulkanTex->vkImage() : nullptr;
+		fprintf( stderr, "[paint_window] #%d: lastCommit=%p lastTex=%p heldTex=%p qlen=%zu\n",
+			s_nPaintDiag, (void*)lastCommit.get(), lastTex, heldTex,
+			w ? w->commit_queue.size() : 0 );
+	}
+
 	if ( flags & PaintWindowFlag::BasePlane )
 	{
 		if ( lastCommit == nullptr || cv_paint_debug_pause_base_plane )
@@ -2707,11 +2725,96 @@ paint_all( global_focus_t *pFocus, bool async )
 	}
 
 	// Draw cursor if we need to
-	if (input && ShouldDrawCursor() && cv_paint_cursor_plane) {
+	// [sunshine] Пропускаем X11 cursor для XDG окон (KWin) — XFixesGetCursorImage()
+	// делает blocking X11 roundtrip к XWayland, который не владеет cursor'ом.
+	// Для XDG: Wayland cursor path ниже (строка ~2736).
+	if (input && ShouldDrawCursor() && cv_paint_cursor_plane
+		&& ( !pFocus->inputFocusWindow
+			|| pFocus->inputFocusWindow->type != steamcompmgr_win_type_t::XDG ) ) {
 		pFocus->cursor->paint(
 			input, w == input ? override : nullptr,
 			&frameInfo);
 	}
+
+	// [sunshine] Wayland cursor layer для XDG окон (KWin).
+	// KWin не создаёт pFocus->cursor (MouseCursor), но задаёт cursor через
+	// wl_pointer.set_cursor → wlserver.wayland_cursor_surface.
+	// ВНИМАНИЕ: pFocus->cursor ВСЕГДА не-null (= root_ctx->cursor.get()),
+	// поэтому проверяем тип окна == XDG.
+	// НЕ используем wlserver_lock() — waylock non-recursive.
+	if ( pFocus->inputFocusWindow
+		&& pFocus->inputFocusWindow->type == steamcompmgr_win_type_t::XDG
+		&& ShouldDrawCursor() && cv_paint_cursor_plane )
+	{
+		static gamescope::OwningRc<CVulkanTexture> s_waylandCursorTex;
+		static struct wlr_surface *s_lastCursorSurf = nullptr;
+		static uint32_t s_lastCursorSerial = 0;
+
+		struct wlr_surface *cursorSurf = wlserver.wayland_cursor_surface;
+		int32_t hotX = wlserver.wayland_cursor_hotspot_x;
+		int32_t hotY = wlserver.wayland_cursor_hotspot_y;
+		double cursorX = wlserver.mouse_surface_cursorx;
+		double cursorY = wlserver.mouse_surface_cursory;
+
+		// Одноразовая диагностика
+		static int s_nDiagCount = 0;
+		if ( s_nDiagCount < 5 && cursorSurf )
+		{
+			fprintf( stderr, "[sunshine] cursor diag: surf=%p buffer=%p pos=(%.0f,%.0f) hot=(%d,%d)\n",
+				cursorSurf, (void*)cursorSurf->buffer, cursorX, cursorY, hotX, hotY );
+			s_nDiagCount++;
+		}
+		else if ( s_nDiagCount < 2 )
+		{
+			fprintf( stderr, "[sunshine] cursor diag: surf=%p (nullptr), pFocus->cursor=%p\n",
+				cursorSurf, pFocus->cursor );
+			s_nDiagCount++;
+		}
+
+		if ( cursorSurf && cursorSurf->buffer )
+		{
+			// Update texture if surface or serial changed
+			uint32_t serial = cursorSurf->current.seq;
+			if ( cursorSurf != s_lastCursorSurf || serial != s_lastCursorSerial )
+			{
+				s_lastCursorSurf = cursorSurf;
+				s_lastCursorSerial = serial;
+				s_waylandCursorTex = vulkan_create_texture_from_wlr_buffer( &cursorSurf->buffer->base, nullptr );
+				if ( s_waylandCursorTex )
+				{
+					fprintf( stderr, "[sunshine] Wayland cursor texture created: %ux%u\n",
+						s_waylandCursorTex->contentWidth(), s_waylandCursorTex->contentHeight() );
+				}
+			}
+
+			if ( s_waylandCursorTex )
+			{
+				int curLayer = frameInfo.layerCount++;
+				FrameInfo_t::Layer_t *layer = &frameInfo.layers[ curLayer ];
+
+				layer->opacity = 1.0;
+				layer->scale.x = 1.0f;
+				layer->scale.y = 1.0f;
+
+				// Position: cursor position (scaled) minus hotspot
+				float scaledX = cursorX - hotX;
+				float scaledY = cursorY - hotY;
+
+				layer->offset.x = -scaledX;
+				layer->offset.y = -scaledY;
+				layer->zpos = g_zposCursor;
+				layer->applyColorMgmt = false;
+				layer->tex = s_waylandCursorTex;
+				layer->filter = GamescopeUpscaleFilter::NEAREST;
+				layer->blackBorder = false;
+				layer->ctm = nullptr;
+				layer->hdr_metadata_blob = nullptr;
+				layer->colorspace = GAMESCOPE_APP_TEXTURE_COLORSPACE_SRGB;
+				layer->eAlphaBlendingMode = ALPHA_BLENDING_MODE_PREMULTIPLIED;
+			}
+		}
+	}
+
 
 	if ( !bValidContents || GetBackend()->IsPaused() )
 	{
@@ -4198,6 +4301,12 @@ determine_and_apply_focus( global_focus_t *pFocus )
 
 				if ( win_surface(pFocus->inputFocusWindow) != nullptr && pFocus->cursor )
 					wlserver_mousefocus( pFocus->inputFocusWindow->main_surface(), pFocus->cursor->x(), pFocus->cursor->y() );
+				// [sunshine] XDG cursor support: KWin — XDG клиент, pFocus->cursor не реализован.
+				// Вызываем mousefocus напрямую с текущей позицией из wlserver.
+				else if ( win_surface(pFocus->inputFocusWindow) != nullptr
+				       && pFocus->inputFocusWindow->type == steamcompmgr_win_type_t::XDG )
+					wlserver_mousefocus( pFocus->inputFocusWindow->main_surface(),
+						wlserver.mouse_surface_cursorx, wlserver.mouse_surface_cursory );
 
 				if ( win_surface(pFocus->keyboardFocusWindow) != nullptr )
 					wlserver_keyboardfocus( pFocus->keyboardFocusWindow->main_surface() );
@@ -5630,6 +5739,10 @@ steamcompmgr_flush_frame_done( steamcompmgr_win_t *w )
 
 		wlserver_unlock();
 	}
+
+	// [sunshine] Безусловный frame_done на subsurface УБРАН.
+	// Вызывает чёрный экран из-за наводнения KWin callbacks.
+	// ROOT CAUSE в другом: wp_presentation_feedback потерян.
 }
 
 static std::optional<uint64_t> s_oLowestFPSLimitScheduleVRR;
@@ -6674,6 +6787,10 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 			w->commit_queue[ j ]->present_margin = earliestPresentTime - earliestLatchTime;
 			bFoundWindow = true;
 
+			// [sunshine] Агрегированная диагностика focus matching
+			static int s_nDoneCommitDiag = 0;
+
+
 			// Window just got a new available commit, determine if that's worth a repaint
 
 			// If this is a forwarded vr plane, repaint
@@ -6750,6 +6867,13 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 		if ( j > 0 )
 			w->commit_queue.erase( w->commit_queue.begin(), w->commit_queue.begin() + j );
 		w->receivedDoneCommit = true;
+
+		// [sunshine] XDG commit done → force repaint.
+		// Заменяет FORCE_REPAINT: обновление только при новом KWin frame.
+		// 0 fps при idle desktop, 60fps при активности.
+		if ( w->type == steamcompmgr_win_type_t::XDG )
+			g_bForceRepaint = true;
+
 		return true;
 	}
 
@@ -6833,6 +6957,18 @@ void handle_done_commits_xdg( bool vblank, uint64_t vblank_idx )
 {
 	std::lock_guard<std::mutex> lock( g_steamcompmgr_xdg_done_commits.listCommitsDoneLock );
 
+	// [sunshine] Диагностика listCommitsDone
+	static int s_nDoneCommitsDiag = 0;
+	s_nDoneCommitsDiag++;
+	if ( !g_steamcompmgr_xdg_done_commits.listCommitsDone.empty() &&
+		( s_nDoneCommitsDiag <= 20 || s_nDoneCommitsDiag % 500 == 0 ) )
+	{
+		fprintf( stderr, "[handle_done_xdg] #%d: listDone=%zu vblank=%d\n",
+			s_nDoneCommitsDiag,
+			g_steamcompmgr_xdg_done_commits.listCommitsDone.size(),
+			vblank ? 1 : 0 );
+	}
+
 	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
 
 	// commits that were not ready to be presented based on their display timing.
@@ -6897,6 +7033,7 @@ void handle_presented_for_window( steamcompmgr_win_t* w )
 		: g_SteamCompMgrAppRefreshCycle;
 
 	commit_t *lastCommit = get_window_last_done_commit_peek(w);
+
 	if (lastCommit)
 	{
 		// We might present the same commit multiple times. In these cases
@@ -7079,6 +7216,18 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 	bool for_current_surface = !w->override_surface() || w->current_surface() == reslistentry.surf;
 
+	// [sunshine] Полная диагностика всех ветвлений
+	static int s_nUpdateDiag = 0;
+	s_nUpdateDiag++;
+	if ( s_nUpdateDiag <= 30 || s_nUpdateDiag % 200 == 0 )
+	{
+		fprintf( stderr, "[update_wayland_res] #%d: buf=%p %dx%d surf=%p bogus=%d damage=%d onlyCurr=%d forCurr=%d override=%p current=%p qlen=%zu\n",
+			s_nUpdateDiag, (void*)buf, buf->width, buf->height, (void*)reslistentry.surf,
+			bPossiblyBogus, bHasDamage, bOnlyCurrentSurface, for_current_surface,
+			(void*)w->override_surface(), (void*)w->current_surface(),
+			w->commit_queue.size() );
+	}
+
 	if ( !for_current_surface )
 	{
 		xwm_log.debugf( "Got commit not for current surface." );
@@ -7086,6 +7235,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 	if ( bOnlyCurrentSurface && !for_current_surface )
 	{
+		if ( s_nUpdateDiag <= 30 || s_nUpdateDiag % 200 == 0 )
+			fprintf( stderr, "[update_wayland_res] #%d: DROPPED (bOnlyCurrentSurface && !forCurr)\n", s_nUpdateDiag );
 		wlserver_lock();
 		wlr_buffer_unlock( buf );
 		wlserver_unlock();
@@ -7102,6 +7253,8 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 
 	if ( already_exists && !reslistentry.feedback && reslistentry.presentation_feedbacks.empty() )
 	{
+		if ( s_nUpdateDiag <= 30 || s_nUpdateDiag % 200 == 0 )
+			fprintf( stderr, "[update_wayland_res] #%d: DROPPED (already_exists buf=%p)\n", s_nUpdateDiag, (void*)buf );
 		wlserver_lock();
 		wlr_buffer_unlock( buf );
 		wlserver_unlock();
@@ -7255,7 +7408,13 @@ void update_wayland_res(CommitDoneList_t *doneCommits, steamcompmgr_win_t *w, Re
 		gpuvis_trace_printf( "pushing wait for commit %lu win %lx", newCommit->commitID, w->type == steamcompmgr_win_type_t::XWAYLAND ? w->xwayland().id : 0 );
 		{
 			newCommit->SetFence( fence, mango_nudge, doneCommits );
-			if ( bKnownReady )
+
+			// [sunshine] Для XDG commits (KWin): NVIDIA implicit sync
+			// через poll(dup(dmabuf.fd)) НЕ РАБОТАЕТ — fence никогда
+			// не сигналит EPOLLIN. wl_surface.commit гарантирует
+			// rendering submitted, данные в GPU VRAM готовы.
+			// Сигналим сразу, минуя g_ImageWaiter.
+			if ( bKnownReady || w->type == steamcompmgr_win_type_t::XDG )
 				newCommit->Signal();
 			else
 				g_ImageWaiter.AddWaitable( newCommit.get() );
@@ -7282,8 +7441,35 @@ void check_new_xwayland_res(xwayland_ctx_t *ctx)
 void check_new_xdg_res()
 {
 	std::vector<ResListEntry_t> tmp_queue = wlserver_xdg_commit_queue();
+
 	for ( uint32_t i = 0; i < tmp_queue.size(); i++ )
 	{
+		// [sunshine] Фильтрация 1×1 dummy буферов от KWin main surface.
+		// KWin рендерит dummy в main surface, реальный контент — в subsurface.
+		if ( tmp_queue[i].buf && tmp_queue[i].buf->width <= 4 && tmp_queue[i].buf->height <= 4 )
+		{
+			// [sunshine FIX T1] Dummy commit содержит presentation_feedbacks от KWin!
+			// Без отправки presented → KWin RenderLoop навсегда блокируется.
+			wlserver_lock();
+			if ( !tmp_queue[i].presentation_feedbacks.empty() )
+			{
+				wlserver_presentation_feedback_presented(
+					tmp_queue[i].surf,
+					tmp_queue[i].presentation_feedbacks,
+					get_time_in_nanos(),
+					g_SteamCompMgrAppRefreshCycle );
+			}
+			{
+				struct timespec now;
+				clock_gettime(CLOCK_MONOTONIC, &now);
+				wlr_surface_send_frame_done( tmp_queue[i].surf, &now );
+			}
+			wlserver_unlock();
+
+			wlr_buffer_unlock( tmp_queue[i].buf );
+			continue;
+		}
+
 		for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
 		{
 			if ( xdg_win->xdg().surface.main_surface == tmp_queue[ i ].surf )
@@ -7972,6 +8158,19 @@ void steamcompmgr_check_xdg(bool vblank, uint64_t vblank_idx)
 		for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
 		{
 			steamcompmgr_flush_frame_done(xdg_win.get());
+
+			// [sunshine] Bootstrap: безусловная отправка frame_done
+			// для XDG окон, которые ещё не начали рендерить.
+			// Ломает deadlock: KWin ждёт frame_callback → Gamescope ждёт commit.
+			wlr_surface *bootstrap_surface = xdg_win->current_surface();
+			if ( bootstrap_surface && !xdg_win->unlockedForFrameCallback )
+			{
+				struct timespec now;
+				clock_gettime(CLOCK_MONOTONIC, &now);
+				wlserver_lock();
+				wlserver_send_frame_done(bootstrap_surface, &now);
+				wlserver_unlock();
+			}
 		}
 
 		wlserver_lock();
@@ -8798,6 +8997,90 @@ steamcompmgr_main(int argc, char **argv)
 		// as needing a repaint.
 		if ( is_fading_out() )
 			hasRepaint = true;
+
+		// [sunshine] Heartbeat / force repaint.
+		// GAMESCOPE_SUNSHINE_FORCE_REPAINT=Hz — принудительная частота (для отладки).
+		// По умолчанию = 1 fps heartbeat (keepalive для screencopy при переподключении).
+		// При активности — event-driven через g_bForceRepaint (до 60fps).
+		{
+			static int s_nForceRepaintHz = -1;
+			if ( s_nForceRepaintHz == -1 )
+			{
+				const char *pHz = getenv( "GAMESCOPE_SUNSHINE_FORCE_REPAINT" );
+				s_nForceRepaintHz = pHz ? atoi( pHz ) : 0; // default: 0 (event-driven only)
+				if ( s_nForceRepaintHz > 0 )
+					fprintf( stderr, "[sunshine] Force repaint: %d Hz\n", s_nForceRepaintHz );
+			}
+			if ( s_nForceRepaintHz > 0 )
+			{
+				static auto s_tLastForce = std::chrono::steady_clock::now();
+				auto now = std::chrono::steady_clock::now();
+				auto intervalUs = std::chrono::microseconds( 1'000'000 / s_nForceRepaintHz );
+				if ( now - s_tLastForce >= intervalUs )
+				{
+					s_tLastForce = now;
+					hasRepaint = true;
+				}
+			}
+		}
+
+		// [sunshine] Cursor test: программная инъекция mouse events.
+		// GAMESCOPE_SUNSHINE_CURSOR_TEST=1 — warp курсор в разные позиции и dump PPM.
+		{
+			static int s_nCursorTest = -1;
+			if ( s_nCursorTest == -1 )
+			{
+				const char *pTest = getenv( "GAMESCOPE_SUNSHINE_CURSOR_TEST" );
+				s_nCursorTest = pTest ? atoi( pTest ) : 0;
+				if ( s_nCursorTest > 0 )
+					fprintf( stderr, "[sunshine] Cursor test ENABLED\n" );
+			}
+			if ( s_nCursorTest > 0 )
+			{
+				static auto s_tStart = std::chrono::steady_clock::now();
+				auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+					std::chrono::steady_clock::now() - s_tStart ).count();
+				static int s_nPhase = 0;
+
+				if ( elapsed >= 18 && s_nPhase == 0 )
+				{
+					// Фаза 1: курсор в центр
+					fprintf( stderr, "[sunshine] Cursor test: phase 1 — warp to CENTER (960, 540)\n" );
+					wlserver_lock();
+					wlserver_mousewarp( 960, 540, 0, false );
+					wlserver_unlock();
+					hasRepaint = true;
+					s_nPhase = 1;
+				}
+				else if ( elapsed >= 20 && s_nPhase == 1 )
+				{
+					// Фаза 1: dump PPM (2с после warp, чтобы KWin перерисовал)
+					fprintf( stderr, "[sunshine] Cursor test: phase 1 — dump PPM\n" );
+					snprintf( g_szSunshineDumpName, sizeof(g_szSunshineDumpName), "/tmp/cursor_center.ppm" );
+					g_nSunshineDumpRequest.store( 1 );
+					s_nPhase = 2;
+				}
+				else if ( elapsed >= 23 && s_nPhase == 2 )
+				{
+					// Фаза 2: курсор в левый нижний угол
+					fprintf( stderr, "[sunshine] Cursor test: phase 2 — warp to CORNER (100, 900)\n" );
+					wlserver_lock();
+					wlserver_mousewarp( 100, 900, 0, false );
+					wlserver_unlock();
+					hasRepaint = true;
+					s_nPhase = 3;
+				}
+				else if ( elapsed >= 25 && s_nPhase == 3 )
+				{
+					// Фаза 2: dump PPM
+					fprintf( stderr, "[sunshine] Cursor test: phase 2 — dump PPM\n" );
+					snprintf( g_szSunshineDumpName, sizeof(g_szSunshineDumpName), "/tmp/cursor_corner.ppm" );
+					g_nSunshineDumpRequest.store( 1 );
+					s_nPhase = 4;
+					fprintf( stderr, "[sunshine] Cursor test COMPLETE\n" );
+				}
+			}
+		}
 
 		bool bPainted = false;
 

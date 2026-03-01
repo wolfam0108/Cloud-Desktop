@@ -197,6 +197,48 @@ struct wlserver_t {
     struct wlr_keyboard_group *keyboard_group;
     struct wl_listener keyboard_group_modifiers;
     struct wl_listener keyboard_group_key;
+
+    // Sunshine backend fields
+    struct wlr_output *sunshine_output = nullptr;
+    struct wlr_output_state *sunshine_output_state = nullptr;
+    struct wlr_screencopy_manager_v1 *sunshine_screencopy_manager = nullptr;
+    struct wlr_allocator *sunshine_allocator = nullptr;
+    struct wlr_output_layout *sunshine_output_layout = nullptr;
+    struct wlr_xdg_output_manager_v1 *sunshine_xdg_output_manager = nullptr;
+    int sunshine_eventfd = -1;
+    struct wl_event_source *sunshine_event_source = nullptr;
+    void *sunshine_pending_slot = nullptr;   // GBMSlot* — pending buffer от Present()
+    void *sunshine_committed_slot = nullptr;  // GBMSlot* — последний committed, для release
+    void (*sunshine_release_func)(void*) = nullptr; // callback для release slot (ставит in_use=false)
+    std::mutex sunshine_lock;                // защита sunshine_pending_slot
+
+    // [sunshine] VBlank Timer: эмуляция vblank для headless output.
+    // send_frame() вызывается только по timer, не при каждом Present().
+    struct wl_event_source *sunshine_vblank_timer = nullptr;
+    bool sunshine_has_pending_frame = false;
+    // [OPT-1] Режим VBlank: 0=direct, 1=1x(60Hz), 2=2x(120Hz), 4=4x(240Hz)
+    int sunshine_vblank_mode = 0;
+
+    // [sunshine] Lockfree input: mouse motion через atomic (без lock).
+    // VBlank timer забирает pending motion и отправляет в Wayland.
+    std::atomic<double> sunshine_pending_dx{0.0};
+    std::atomic<double> sunshine_pending_dy{0.0};
+    std::atomic<bool>   sunshine_has_pending_motion{false};
+    std::atomic<uint32_t> sunshine_input_seq{0};
+
+    // [sunshine] Батчинг motion: input семплируется 2x, отправляется KWin 1x (с frame signal).
+    // Предотвращает лавину коммитов KWin при каждом motion event.
+    double sunshine_batched_dx = 0.0;
+    double sunshine_batched_dy = 0.0;
+    int sunshine_tick_counter = 0;
+
+    // [sunshine] Wayland cursor от XDG клиентов (KWin).
+    // KWin задаёт cursor через wl_pointer.set_cursor → сохраняем surface + hotspot.
+    struct wlr_surface *wayland_cursor_surface = nullptr;
+    int32_t wayland_cursor_hotspot_x = 0;
+    int32_t wayland_cursor_hotspot_y = 0;
+    std::atomic<bool> wayland_cursor_changed{false};
+    struct wl_listener request_set_cursor_listener;
 };
 
 extern struct wlserver_t wlserver;
