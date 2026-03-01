@@ -223,7 +223,11 @@ ninja -C /home/user/kcm-cloud-mouse/build install
 
 ## 5. Очистка build-зависимостей
 
-После успешной сборки и тестирования можно удалить ~10 ГБ build-артефактов:
+После успешной сборки и тестирования можно удалить ~10 ГБ build-артефактов.
+
+> [!CAUTION]
+> **Не используйте** `dnf remove $(rpm -qa '*-devel')` — это каскадно удалит runtime-библиотеки
+> (`libseat`, `libinput`, `libxkbcommon` и т.д.), которые нужны Gamescope для работы!
 
 ```bash
 # 1. CUDA Toolkit (4.5 ГБ)
@@ -237,26 +241,62 @@ rm -f /home/user/*.tar.gz
 rm -f /tmp/NVIDIA-Linux-*.run /tmp/cuda_*.run
 rm -rf /tmp/nvidia-patch
 
-# 4. Build-пакеты
+# 4. Build-пакеты (компиляторы, генераторы, тулинг)
 dnf remove -y \
   gcc-c++ gcc cpp meson ninja-build cmake cmake-data \
   npm nodejs nodejs-full-i18n nodejs-docs nodejs-npm \
-  doxygen graphviz rpm-build libstdc++-static git \
+  doxygen graphviz rpm-build libstdc++-static \
   extra-cmake-modules
 
-# 5. Devel-пакеты
-dnf remove -y $(rpm -qa '*-devel' | tr '\n' ' ')
+# 5. Devel-пакеты (ТОЛЬКО безопасные — без runtime-зависимостей Gamescope)
+dnf remove -y \
+  libX11-devel libXdamage-devel libXcomposite-devel libXcursor-devel \
+  libXrender-devel libXext-devel libXfixes-devel libXxf86vm-devel \
+  libXtst-devel libXres-devel libXmu-devel libXi-devel \
+  libdrm-devel mesa-libgbm-devel mesa-libEGL-devel \
+  vulkan-devel vulkan-headers \
+  libinput-devel libxkbcommon-devel \
+  wayland-devel wayland-protocols-devel \
+  pixman-devel libcap-devel libei-devel \
+  libdisplay-info-devel libseat-devel libdecor-devel \
+  luajit-devel systemd-devel \
+  xorg-x11-server-Xwayland-devel \
+  xcb-util-wm-devel xcb-util-errors-devel \
+  glib2-devel pipewire-devel \
+  libnotify-devel libayatana-appindicator-gtk3-devel \
+  opus-devel pulseaudio-libs-devel \
+  openssl-devel libcurl-devel miniupnpc-devel \
+  libevdev-devel libva-devel \
+  boost-devel numactl-devel \
+  qt6-qtbase-devel qt6-qtdeclarative-devel \
+  kf6-kcmutils-devel kf6-ki18n-devel kf6-kcoreaddons-devel
 
 # 6. Автоматическая очистка
 dnf autoremove -y
 dnf clean all
 ```
 
-> [!WARNING]
-> После удаления `-devel` пакетов проверьте, что `plasmashell` не был удалён каскадно:
-> ```bash
-> which plasmashell || dnf install -y plasmashell kactivitymanagerd kded polkit-kde
-> ```
+### Проверка runtime-зависимостей
+
+После очистки **обязательно** проверьте, что Gamescope и Plasma запускаются:
+
+```bash
+# Gamescope — все библиотеки на месте?
+ldd /usr/local/bin/gamescope | grep "not found"
+
+# Plasma — не удалена каскадно?
+which plasmashell || dnf install -y plasmashell kactivitymanagerd kded polkit-kde
+
+# Ключевые runtime-библиотеки
+rpm -q libseat libinput libxkbcommon libei libdecor dbus-x11
+```
+
+Если `ldd` показывает `not found` — установите недостающие пакеты:
+
+```bash
+# Пример: libseat удалена каскадно
+dnf install -y libseat libinput libxkbcommon
+```
 
 ### Результат
 

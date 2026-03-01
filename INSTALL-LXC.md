@@ -430,7 +430,7 @@ dnf install -y \
   polkit-kde \
   xorg-x11-server-Xwayland \
   pipewire pipewire-pulseaudio wireplumber \
-  dbus-daemon \
+  dbus-daemon dbus-x11 \
   gsettings-desktop-schemas \
   plasma-desktop krdp konsole dolphin fuse \
   xdg-desktop-portal-kde binutils \
