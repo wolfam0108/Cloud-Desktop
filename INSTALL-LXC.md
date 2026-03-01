@@ -10,24 +10,147 @@
 
 ## Содержание
 
+0. [Подготовка хоста (Proxmox)](#0-подготовка-хоста-proxmox)
 1. [Требования](#1-требования)
 2. [Создание LXC-контейнера](#2-создание-lxc-контейнера)
 3. [Настройка конфигурации LXC](#3-настройка-конфигурации-lxc)
 4. [Подготовка контейнера](#4-подготовка-контейнера)
 5. [Установка NVIDIA драйвера](#5-установка-nvidia-драйвера)
 6. [Патчи NvFBC и NVENC](#6-патчи-nvfbc-и-nvenc)
-7. [Установка CUDA Toolkit](#7-установка-cuda-toolkit)
-8. [Сборка Gamescope](#8-сборка-gamescope)
-9. [Сборка Sunshine](#9-сборка-sunshine)
-10. [Установка KDE Plasma](#10-установка-kde-plasma)
-11. [Настройка скриптов и конфигов](#11-настройка-скриптов-и-конфигов)
-12. [Настройка Sunshine](#12-настройка-sunshine)
-13. [Shutdown/Reboot через интерфейс KDE](#13-shutdownreboot-через-интерфейс-kde)
-14. [Настройка мыши — KCM Cloud Mouse (опционально)](#14-настройка-мыши--kcm-cloud-mouse-опционально)
-15. [Systemd-сервис и автозапуск](#15-systemd-сервис-и-автозапуск)
-16. [Очистка build-зависимостей](#16-очистка-build-зависимостей)
-17. [Подключение через Moonlight](#17-подключение-через-moonlight)
-18. [Решение проблем](#18-решение-проблем)
+7. [Сборка и установка компонентов](#7-сборка-и-установка-компонентов)
+8. [Установка KDE Plasma](#8-установка-kde-plasma)
+9. [Настройка скриптов и конфигов](#9-настройка-скриптов-и-конфигов)
+10. [Настройка Sunshine](#10-настройка-sunshine)
+11. [Shutdown/Reboot через интерфейс KDE](#11-shutdownreboot-через-интерфейс-kde)
+12. [Настройка мыши — KCM Cloud Mouse (опционально)](#12-настройка-мыши--kcm-cloud-mouse-опционально)
+13. [Systemd-сервис и автозапуск](#13-systemd-сервис-и-автозапуск)
+14. [Подключение через Moonlight](#14-подключение-через-moonlight)
+15. [Решение проблем](#15-решение-проблем)
+
+---
+
+## 0. Подготовка хоста (Proxmox)
+
+Все команды в этом разделе выполняются **на хосте Proxmox**, а не внутри контейнера.
+
+### 0.1 NVIDIA драйвер на хосте
+
+На хосте должен быть установлен NVIDIA драйвер с загруженными модулями ядра. Проверка:
+
+```bash
+nvidia-smi                      # GPU видна и драйвер работает
+lsmod | grep nvidia              # модули загружены
+```
+
+Должны быть загружены модули:
+
+| Модуль | Назначение |
+|---|---|
+| `nvidia` | Основной драйвер GPU |
+| `nvidia_modeset` | Моду переключения режимов (mode setting) |
+| `nvidia_drm` | DRM интеграция (DRI, render nodes) |
+| `nvidia_uvm` | Unified Virtual Memory (для CUDA) |
+
+### 0.2 nvidia-drm modeset=1
+
+Модуль `nvidia-drm` должен быть загружен с параметром `modeset=1`. Без этого контейнер не получит доступ к render node (`/dev/dri/renderD128`).
+
+```bash
+# Проверить текущий параметр
+cat /sys/module/nvidia_drm/parameters/modeset
+# Должно быть: Y
+```
+
+Если `N` — создайте конфиг:
+
+```bash
+cat > /etc/modprobe.d/nvidia-drm.conf << 'EOF'
+options nvidia-drm modeset=1
+EOF
+
+# Перестроить initramfs и перезагрузить хост
+update-initramfs -u
+reboot
+```
+
+### 0.3 Blacklist nouveau
+
+Убедитесь, что `nouveau` заблокирован:
+
+```bash
+cat > /etc/modprobe.d/blacklist-nouveau.conf << 'EOF'
+blacklist nouveau
+options nouveau modeset=0
+EOF
+```
+
+### 0.4 Определение major-номеров устройств
+
+Major-номера устройств **отличаются на разных системах**. Определите ваши:
+
+```bash
+cat /proc/devices | grep -E "nvidia|drm|input|alsa|snd"
+```
+
+Типичный вывод:
+
+```
+ 13 input
+116 alsa
+195 nvidia / nvidia-modeset / nvidiactl
+226 drm
+235 nvidia-caps
+508 nvidia-uvm          # ← этот номер ДИНАМИЧЕСКИЙ!
+```
+
+> [!CAUTION]
+> Major-номер `nvidia-uvm` **меняется при каждой перезагрузке хоста**. Используйте скрипт `deploy/nvidia/fix-nvidia-uvm-major.sh` для автоматического обновления LXC-конфига после ребута.
+
+### 0.5 Fedora LXC: разблокировка capabilities
+
+Proxmox'овский шаблон Fedora содержит файл `/usr/share/lxc/config/fedora.common.conf`, который по умолчанию блокирует ряд Linux capabilities:
+
+```
+lxc.cap.drop = setfcap sys_nice sys_pacct sys_rawio
+```
+
+Для Cloud Desktop необходимо разблокировать **`setfcap`** и **`sys_nice`**:
+
+| Capability | Зачем нужна |
+|---|---|
+| `setfcap` | Установка file capabilities при `dnf install` (без неё RPM-транзакции падают) |
+| `sys_nice` | KWin использует `nice`/`ionice` для приоритизации рендеринга |
+
+```bash
+# Бэкап
+cp /usr/share/lxc/config/fedora.common.conf \
+   /usr/share/lxc/config/fedora.common.conf.bak
+
+# Убрать setfcap и sys_nice из drop-списка
+sed -i 's/lxc.cap.drop = setfcap sys_nice sys_pacct sys_rawio/lxc.cap.drop = sys_pacct sys_rawio/' \
+  /usr/share/lxc/config/fedora.common.conf
+
+# Проверить результат
+grep "lxc.cap.drop" /usr/share/lxc/config/fedora.common.conf
+# Должно быть: lxc.cap.drop = sys_pacct sys_rawio
+```
+
+> [!WARNING]
+> Это изменение влияет на **все Fedora-контейнеры** на данном хосте.
+> Если контейнер уже запущен — перезапустите его: `pct stop <CTID> && pct start <CTID>`
+
+**Проверка внутри контейнера:**
+
+```bash
+pct exec <CTID> -- bash -c '
+  touch /tmp/testcap
+  setcap cap_net_admin+ep /tmp/testcap 2>&1 && echo "setcap OK" || echo "setcap FAIL"
+  rm -f /tmp/testcap
+'
+```
+
+> [!TIP]
+> Альтернативный workaround без изменения глобального конфига: `dnf install --setopt=tsflags=nocaps <packages>`. Но при этом file capabilities не устанавливаются — некоторые программы могут работать некорректно.
 
 ---
 
@@ -160,6 +283,27 @@ pct exec <CTID> -- ls -la /dev/nvidia0 /dev/dri/renderD128
 
 Если оба файла видны — конфигурация верна.
 
+### 3.5 Фикс nvidia-uvm major после ребута хоста
+
+Major-номер `/dev/nvidia-uvm` **динамический** — меняется при каждой перезагрузке хоста Proxmox. Если в LXC-конфиге указан устаревший номер, контейнер не получит доступ к CUDA.
+
+Используйте скрипт из `deploy/nvidia/`:
+
+```bash
+# На хосте Proxmox
+# Проверить текущий vs прописанный major
+./fix-nvidia-uvm-major.sh <CTID>
+
+# Автоматически обновить конфиг
+./fix-nvidia-uvm-major.sh <CTID> --apply
+
+# Перезапустить контейнер
+pct stop <CTID> && pct start <CTID>
+```
+
+> [!TIP]
+> Рекомендуется добавить вызов этого скрипта в автозапуск хоста (например, в `/etc/rc.local` или systemd timer), чтобы LXC-конфиг обновлялся автоматически при каждом ребуте.
+
 ---
 
 ## 4. Подготовка контейнера
@@ -258,172 +402,26 @@ bash patch.sh
 
 ---
 
-## 7. Установка CUDA Toolkit
+## 7. Сборка и установка компонентов
 
-CUDA необходим **только для сборки** Sunshine с поддержкой аппаратного кодирования.
+Gamescope и Sunshine необходимо собрать из исходников.
 
-### 7.1 Передача и установка
+📖 **[BUILD.md](BUILD.md)** — полная инструкция по сборке: CUDA Toolkit, Gamescope, Sunshine, KCM Cloud Mouse, очистка build-зависимостей.
 
-С хоста:
+После выполнения BUILD.md у вас должны быть установлены:
 
-```bash
-pct push <CTID> /path/to/cuda_13.0.0_580.65.06_linux.run /tmp/cuda_13.0.0_580.65.06_linux.run
-```
+| Компонент | Путь | Проверка |
+|---|---|---|
+| Gamescope | `/usr/local/bin/gamescope` | `gamescope --version` |
+| Sunshine | `/usr/bin/sunshine` | `sunshine --version` |
 
-Внутри контейнера:
-
-```bash
-chmod +x /tmp/cuda_13.0.0_580.65.06_linux.run
-/tmp/cuda_13.0.0_580.65.06_linux.run --toolkit --silent --no-drm --override
-```
-
-### 7.2 Патч заголовков (для glibc 2.41+)
-
-На Fedora 43+ с glibc ≥ 2.41 необходимо пропатчить заголовки CUDA:
-
-```bash
-CUDA_MATH="/usr/local/cuda-13.0/targets/x86_64-linux/include/crt/math_functions.h"
-
-# Создаём резервную копию
-cp "$CUDA_MATH" "${CUDA_MATH}.bak"
-
-# Применяем патч
-sed -i '629s/rsqrt(double x);/rsqrt(double x) noexcept(true);/' "$CUDA_MATH"
-sed -i '653s/rsqrtf(float x);/rsqrtf(float x) noexcept(true);/' "$CUDA_MATH"
-```
-
-### 7.3 Проверка
-
-```bash
-/usr/local/cuda-13.0/bin/nvcc --version
-```
-
-> [!NOTE]
-> CUDA Toolkit будет удалён на этапе [очистки](#16-очистка-build-зависимостей) после сборки.
+> [!IMPORTANT]
+> Sunshine должен быть собран **без `CAP_SYS_ADMIN`** — иначе `AT_SECURE=1` сломает сетевой стек (ENet).
+> Подробности в [BUILD.md → Патч postinst](BUILD.md#33-патч-postinst-для-lxc).
 
 ---
 
-## 8. Сборка Gamescope
-
-### 8.1 Установка build-зависимостей
-
-```bash
-dnf install -y \
-  meson ninja-build gcc-c++ cmake pkg-config \
-  libX11-devel libXdamage-devel libXcomposite-devel libXcursor-devel \
-  libXrender-devel libXext-devel libXfixes-devel libXxf86vm-devel \
-  libXtst-devel libXres-devel libXmu-devel libXi-devel \
-  libdrm-devel mesa-libgbm-devel mesa-libEGL-devel \
-  vulkan-devel vulkan-headers \
-  libinput-devel libxkbcommon-devel \
-  wayland-devel wayland-protocols-devel \
-  pixman-devel libcap-devel libei-devel \
-  libdisplay-info-devel libseat-devel libdecor-devel \
-  luajit-devel systemd-devel \
-  xorg-x11-server-Xwayland-devel \
-  xcb-util-wm-devel xcb-util-errors-devel \
-  glslang
-```
-
-### 8.2 Клонирование и сборка
-
-```bash
-su - user
-
-# Клонирование из форка
-cd ~
-git clone https://github.com/wolfam0108/Cloud-Desktop.git gamescope
-cd gamescope
-
-# Настройка сборки
-meson setup -Dpipewire=disabled build .
-
-# Компиляция (используем все ядра)
-ninja -C build -j$(nproc)
-```
-
-Должно завершиться: `[603/603] Linking target src/gamescope`
-
-### 8.3 Установка
-
-```bash
-# От root
-exit  # если вы под user
-ninja -C /home/user/gamescope/build install
-```
-
-Gamescope установится в `/usr/local/bin/gamescope`.
-
----
-
-## 9. Сборка Sunshine
-
-### 9.1 Дополнительные build-зависимости
-
-```bash
-dnf install -y \
-  glib2-devel pipewire-devel \
-  libnotify-devel libayatana-appindicator-gtk3-devel \
-  npm doxygen graphviz \
-  opus-devel pulseaudio-libs-devel \
-  libstdc++-static rpm-build \
-  openssl-devel libcurl-devel miniupnpc-devel \
-  libevdev-devel libva-devel \
-  boost-devel numactl-devel
-```
-
-### 9.2 Клонирование и сборка
-
-```bash
-su - user
-cd ~
-
-git clone --recurse-submodules https://github.com/LizardByte/Sunshine.git
-cd Sunshine
-
-# Настройка (с CUDA)
-export PATH=/usr/local/cuda-13.0/bin:$PATH
-
-cmake -B build -G Ninja -S . \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX=/usr \
-  -DSUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine \
-  -DSUNSHINE_ENABLE_CUDA=ON \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
-  -DSUNSHINE_ENABLE_DRM=ON \
-  -DSUNSHINE_ENABLE_WAYLAND=ON \
-  -DSUNSHINE_ENABLE_X11=ON \
-  -DSUNSHINE_ENABLE_PORTAL=ON
-
-# Компиляция
-ninja -C build -j$(nproc)
-```
-
-### 9.3 Патч postinst (для LXC)
-
-В LXC не нужен `CAP_SYS_ADMIN`, поэтому отключаем его в post-install скрипте:
-
-```bash
-# Находим строки с cap_sys_admin в postinst и заменяем на заглушку
-sed -i '/cap_sys_admin/s/^/#/' src_assets/linux/misc/postinst
-
-# Добавляем заглушку после закомментированного блока (чтобы if-else не сломался)
-sed -i '/^#.*cap_sys_admin+p.*sunshine/a\    true  # cap_sys_admin disabled for LXC' src_assets/linux/misc/postinst
-```
-
-### 9.4 Создание и установка RPM
-
-```bash
-cpack -G RPM --config ./build/CPackConfig.cmake
-
-# Установка
-exit  # если вы под user
-dnf install -y /home/user/Sunshine/build/cpack_artifacts/Sunshine.rpm
-```
-
----
-
-## 10. Установка KDE Plasma
+## 8. Установка KDE Plasma
 
 ```bash
 dnf install -y \
@@ -433,16 +431,24 @@ dnf install -y \
   xorg-x11-server-Xwayland \
   pipewire pipewire-pulseaudio wireplumber \
   dbus-daemon \
-  gsettings-desktop-schemas
+  gsettings-desktop-schemas \
+  plasma-desktop krdp konsole dolphin fuse \
+  xdg-desktop-portal-kde binutils \
+  plasma-workspace-x11 xorg-x11-server-Xorg \
+  python3-xlib glx-utils xrandr \
+  plasma-discover-flatpak plasma-discover-packagekit \
+  xorg-x11-server-Xvfb xdpyinfo \
+  ffmpeg python3-evdev \
+  vulkan-tools mesa-dri-drivers pipewire-utils wget
 ```
 
 ---
 
-## 11. Настройка скриптов и конфигов
+## 9. Настройка скриптов и конфигов
 
 Все необходимые файлы находятся в каталоге [`deploy/`](deploy/README.md) клонированного репозитория.
 
-### 11.1 Скрипты запуска
+### 9.1 Скрипты запуска
 
 Скопируйте скрипты из `deploy/scripts/` в `/home/user/`:
 
@@ -459,7 +465,7 @@ chmod +x /home/user/gamescope-resize.sh
 chown user:user /home/user/*.sh
 ```
 
-### 11.2 Проверка путей в скриптах
+### 9.2 Проверка путей в скриптах
 
 Убедитесь, что `gamescope-resize.sh` ссылается на правильный путь `gamescopectl`:
 
@@ -471,9 +477,9 @@ grep GAMESCOPECTL /home/user/gamescope-resize.sh
 
 ---
 
-## 12. Настройка Sunshine
+## 10. Настройка Sunshine
 
-### 12.1 Конфигурация
+### 10.1 Конфигурация
 
 ```bash
 su - user
@@ -491,7 +497,7 @@ key_rightalt_to_key_win = enabled
 EOF
 ```
 
-### 12.2 Приложения
+### 10.2 Приложения
 
 ```bash
 cp /home/user/gamescope/deploy/sunshine/apps.json ~/.config/sunshine/apps.json
@@ -502,11 +508,11 @@ cp /home/user/gamescope/deploy/sunshine/apps.json ~/.config/sunshine/apps.json
 
 ---
 
-## 13. Shutdown/Reboot через интерфейс KDE
+## 11. Shutdown/Reboot через интерфейс KDE
 
 По умолчанию KDE Plasma в контейнере не может завершать/перезагружать систему. Для решения этой проблемы используется D-Bus-активируемый wrapper:
 
-### 13.1 Wrapper для ksmserver-logout-greeter
+### 11.1 Wrapper для ksmserver-logout-greeter
 
 ```bash
 cp /home/user/gamescope/deploy/scripts/ksmserver-logout-greeter-wrapper.sh \
@@ -514,7 +520,7 @@ cp /home/user/gamescope/deploy/scripts/ksmserver-logout-greeter-wrapper.sh \
 chmod +x /usr/local/bin/ksmserver-logout-greeter-wrapper
 ```
 
-### 13.2 D-Bus сервис
+### 11.2 D-Bus сервис
 
 ```bash
 su - user
@@ -523,7 +529,7 @@ cp /home/user/gamescope/deploy/systemd/org.kde.LogoutPrompt.service \
    ~/.local/share/dbus-1/services/
 ```
 
-### 13.3 Polkit правила (shutdown/reboot без пароля)
+### 11.3 Polkit правила (shutdown/reboot без пароля)
 
 ```bash
 cp /home/user/gamescope/deploy/polkit/50-cloud-desktop.rules \
@@ -532,48 +538,28 @@ cp /home/user/gamescope/deploy/polkit/50-cloud-desktop.rules \
 
 ---
 
-## 14. Настройка мыши — KCM Cloud Mouse (опционально)
+## 12. Настройка мыши — KCM Cloud Mouse (опционально)
 
-Модуль настроек мыши для KDE System Settings, позволяющий настраивать скорость, ускорение и прокрутку напрямую через рабочий стол.
+Модуль настроек мыши для KDE System Settings — настройка скорости, ускорения и прокрутки.
 
 📦 Репозиторий: [github.com/wolfam0108/kcm-cloud-mouse](https://github.com/wolfam0108/kcm-cloud-mouse)
 
-### Установка
-
-```bash
-# Build-зависимости
-dnf install -y \
-  extra-cmake-modules \
-  qt6-qtbase-devel qt6-qtdeclarative-devel \
-  kf6-kcmutils-devel kf6-ki18n-devel kf6-kcoreaddons-devel
-
-# Сборка
-su - user
-cd ~
-git clone https://github.com/wolfam0108/kcm-cloud-mouse.git
-cd kcm-cloud-mouse
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build
-
-# Установка (от root)
-exit
-ninja -C /home/user/kcm-cloud-mouse/build install
-```
+Сборка и установка описаны в [BUILD.md → KCM Cloud Mouse](BUILD.md#4-сборка-kcm-cloud-mouse-опционально).
 
 После установки модуль появится в **System Settings → Input Devices → Cloud Mouse**.
 
 ---
 
-## 15. Systemd-сервис и автозапуск
+## 13. Systemd-сервис и автозапуск
 
-### 15.1 Установка сервиса
+### 13.1 Установка сервиса
 
 ```bash
 cp /home/user/gamescope/deploy/systemd/cloud-desktop.service \
    /etc/systemd/system/cloud-desktop.service
 ```
 
-### 15.2 Активация автозапуска
+### 13.2 Активация автозапуска
 
 ```bash
 systemctl daemon-reload
@@ -581,7 +567,7 @@ systemctl enable cloud-desktop.service
 systemctl start cloud-desktop.service
 ```
 
-### 15.3 Проверка статуса
+### 13.3 Проверка статуса
 
 ```bash
 systemctl status cloud-desktop.service
@@ -589,52 +575,7 @@ systemctl status cloud-desktop.service
 
 ---
 
-## 16. Очистка build-зависимостей
-
-После успешной сборки и тестирования можно удалить ~10 ГБ build-артефактов:
-
-```bash
-# 1. CUDA Toolkit (4.5 ГБ)
-rm -rf /usr/local/cuda-13.0 /usr/local/cuda
-
-# 2. Исходники (4.6 ГБ)
-rm -rf /home/user/gamescope /home/user/Sunshine /home/user/kcm-cloud-mouse
-rm -f /home/user/*.tar.gz
-
-# 3. Файлы установщиков
-rm -f /tmp/NVIDIA-Linux-*.run /tmp/cuda_*.run
-rm -rf /tmp/nvidia-patch
-
-# 4. Build-пакеты
-dnf remove -y \
-  gcc-c++ gcc cpp meson ninja-build cmake cmake-data \
-  npm nodejs nodejs-full-i18n nodejs-docs nodejs-npm \
-  doxygen graphviz rpm-build libstdc++-static git \
-  extra-cmake-modules
-
-# 5. Devel-пакеты
-dnf remove -y $(rpm -qa '*-devel' | tr '\n' ' ')
-
-# 6. Автоматическая очистка
-dnf autoremove -y
-dnf clean all
-```
-
-> [!WARNING]
-> После удаления `-devel` пакетов проверьте, что `plasmashell` не был удалён каскадно:
-> ```bash
-> which plasmashell || dnf install -y plasmashell kactivitymanagerd kded polkit-kde
-> ```
-
-### Результат
-
-| Метрика | До очистки | После очистки |
-|---|---|---|
-| Занято на диске | ~13 ГБ | ~3 ГБ |
-
----
-
-## 17. Подключение через Moonlight
+## 14. Подключение через Moonlight
 
 1. Установите [Moonlight](https://moonlight-stream.org/) на клиентское устройство
 2. Откройте веб-интерфейс Sunshine: `https://<IP_КОНТЕЙНЕРА>:47990`
@@ -645,7 +586,7 @@ dnf clean all
 
 ---
 
-## 18. Решение проблем
+## 15. Решение проблем
 
 ### GPU не видна в контейнере
 
@@ -694,3 +635,36 @@ su - user -c "pipewire --version && wireplumber --version"
 ls -la /usr/local/bin/ksmserver-logout-greeter-wrapper
 cat ~/.local/share/dbus-1/services/org.kde.LogoutPrompt.service
 ```
+
+### RPM-транзакции падают: `unable to set CAP_SETFCAP`
+
+Fedora LXC по умолчанию блокирует capability `setfcap`. См. [секцию 0.5](#05-fedora-lxc-разблокировка-capabilities).
+
+Быстрый workaround (не рекомендуется для постоянного использования):
+
+```bash
+dnf install --setopt=tsflags=nocaps <packages>
+```
+
+### Sunshine: Initial Ping Timeout / Hang detected!
+
+Стандартная сборка Sunshine RPM устанавливает `cap_sys_admin+p` через `setcap`. Это активирует **secure execution** (`AT_SECURE=1`), которое блокирует работу ENet (control stream порт 47999). Результат — Moonlight не может подключиться.
+
+| Параметр | С `setcap` (стандартный RPM) | Без `setcap` (наша сборка) |
+|---|---|---|
+| `AT_SECURE` | **1** ❌ | **0** ✅ |
+| Control stream | **Не работает** | ✅ Работает |
+
+**Решение**: собрать Sunshine без `cap_sys_admin` — см. [секцию 9.3](#93-патч-postinst-для-lxc).
+
+### CUDA не работает после ребута хоста
+
+Major-номер `nvidia-uvm` динамический. После перезагрузки хоста он меняется, и LXC-конфиг становится невалидным.
+
+```bash
+# На хосте — проверить и обновить
+./fix-nvidia-uvm-major.sh <CTID> --apply
+pct stop <CTID> && pct start <CTID>
+```
+
+См. [секцию 3.5](#35-фикс-nvidia-uvm-major-после-ребута-хоста).

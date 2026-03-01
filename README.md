@@ -588,23 +588,11 @@ Steam запускается как обычное приложение внут
 
 Подробное руководство по установке в LXC-контейнере Proxmox:
 
-📖 **[INSTALL-LXC.md](INSTALL-LXC.md)** — пошаговая инструкция (18 разделов): создание контейнера, NVIDIA драйвер, сборка, KDE Plasma, Sunshine, автозапуск.
+📖 **[INSTALL-LXC.md](INSTALL-LXC.md)** — установка и настройка Cloud Desktop в LXC-контейнере Proxmox.
 
-📁 **[deploy/](deploy/README.md)** — готовые скрипты, systemd-сервисы, polkit-правила и конфиги для быстрой установки.
+🔧 **[BUILD.md](BUILD.md)** — сборка компонентов из исходников (CUDA, Gamescope, Sunshine, KCM Cloud Mouse).
 
-### Быстрый старт (если среда уже настроена)
-
-```bash
-# Сборка
-git clone --recurse-submodules https://github.com/wolfam0108/Cloud-Desktop.git gamescope
-cd gamescope
-meson setup -Dpipewire=disabled build .
-ninja -C build -j$(nproc)
-sudo ninja -C build install
-
-# Запуск
-gamescope --backend sunshine --expose-wayland -W 1920 -H 1080 -r 60
-```
+📁 **[deploy/](deploy/README.md)** — готовые скрипты, systemd-сервисы, polkit-правила и конфиги.
 
 ---
 
